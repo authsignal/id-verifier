@@ -36,21 +36,14 @@ export const createCredentialsRequest = (options = {}) => {
         throw new Error(`Invalid document types: ${invalidTypes.join(', ')}`);
     }
 
-    // Validate claims
-    const validClaims = Object.values(Claim);
-    const invalidClaims = claims.filter(claim => !validClaims.includes(claim));
-    if (invalidClaims.length > 0) {
-        throw new Error(`Invalid claims: ${invalidClaims.join(', ')}`);
-    }
-
     // Create requests for both protocols
     const requests = [];
 
     for (const protocol of Object.values(Protocol)) {
         let request;
-        if(protocol === Protocol.OPENID4VP) {
+        if (protocol === Protocol.OPENID4VP) {
             request = OpenID4VPProtocolHelper.createRequest(types, claims, nonce);
-        } else if(protocol === Protocol.MDOC) {
+        } else if (protocol === Protocol.MDOC) {
             request = MDOCProtocolHelper.createRequest(types, claims, nonce, jwk);
         }
         if (request) requests.push(request);
@@ -130,7 +123,7 @@ export const requestCredentials = async (requestParams, options = {}) => {
  * @param {Object} credentials - The credentials response from requestCredentials
  * @param {Object} params - Verification params
  * @param {Array<string>} params.trustLists - Names of trust lists to use for determining trust. Defaults to all
- * @param {string} params.origin - The origin of the request (for session transcript generation)
+ * @param {string|string[]} params.origin - The origin(s) of the request (for session transcript generation). Can be a single origin or array of origins to try.
  * @param {string} params.nonce - The nonce from the original request (for session transcript generation)
  * @param {Object} params.jwk - The JWK used to encrypt the request
  * @returns {Promise<Object>} Promise that resolves to the processed credential information
@@ -148,10 +141,13 @@ export const processCredentials = async (credentials, params = {}) => {
     if (!credentials.data)
         throw new Error('Credential response missing data');
 
-    if(credentials.protocol === Protocol.OPENID4VP) {
-        return await OpenID4VPProtocolHelper.verify(credentials.data, trustLists, origin, nonce);
-    } else if(credentials.protocol === Protocol.MDOC) {
-        return await MDOCProtocolHelper.verify(credentials.data, trustLists, origin, nonce, jwk);
+    // Convert single origin to array, or use provided array
+    const origins = Array.isArray(origin) ? origin : (origin ? [origin] : [null]);
+
+    if (credentials.protocol === Protocol.OPENID4VP) {
+        return await OpenID4VPProtocolHelper.verify(credentials.data, trustLists, origins, nonce);
+    } else if (credentials.protocol === Protocol.MDOC) {
+        return await MDOCProtocolHelper.verify(credentials.data, trustLists, origins, nonce, jwk);
     } else {
         throw new Error(`Unsupported protocol: ${credentials.protocol}`);
     }

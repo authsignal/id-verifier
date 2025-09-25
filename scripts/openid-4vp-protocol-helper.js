@@ -28,16 +28,24 @@ class OpenID4VPProtocolHelper {
     _createQueryCredentials(documentTypes, claims) {
         const credentials = [];
         for (const format of ProtocolFormats[this.protocol]) {
-            for(const documentType of documentTypes) {
+            for (const documentType of documentTypes) {
                 const formatClaims = [];
 
                 // Add claims for this format
                 claims.forEach(claim => {
-                    const claimPath = ClaimMappings[format]?.[documentType]?.[claim];
-                    if (claimPath) {
+                    // Check if claim is already in path format (array)
+                    if (Array.isArray(claim)) {
                         formatClaims.push({
-                            path: claimPath
+                            path: claim
                         });
+                    } else {
+                        // Use claim mapping for standard claim names
+                        const claimPath = ClaimMappings[format]?.[documentType]?.[claim];
+                        if (claimPath) {
+                            formatClaims.push({
+                                path: claimPath
+                            });
+                        }
                     }
                 });
 
@@ -48,13 +56,13 @@ class OpenID4VPProtocolHelper {
                         claims: formatClaims,
                         meta: {},
                     };
-                    if(format === CredentialFormat.MSO_MDOC) {
+                    if (format === CredentialFormat.MSO_MDOC) {
                         //https://openid.net/specs/openid-4-verifiable-presentations-1_0.html#appendix-B.2.3
                         credential.meta.doctype_value = documentType;
-                    } else if(format === CredentialFormat.DC_SD_JWT) {
+                    } else if (format === CredentialFormat.DC_SD_JWT) {
                         //https://openid.net/specs/openid-4-verifiable-presentations-1_0.html#appendix-B.3.5
                         credential.meta.vct_values = [];
-                    } else if(format === CredentialFormat.LDP_VC) {
+                    } else if (format === CredentialFormat.LDP_VC) {
                         //https://openid.net/specs/openid-4-verifiable-presentations-1_0.html#appendix-B.1.1
                         credential.meta.type_values = [];
                     }
@@ -66,67 +74,80 @@ class OpenID4VPProtocolHelper {
         return credentials;
     }
 
-    async verify(credentialData, trustLists, origin, nonce) {
+    async verify(credentialData, trustLists, origins, nonce) {
         const vpToken = credentialData.vp_token;
-        for(const key in vpToken) {
-            if(CredentialId[key].format === CredentialFormat.MSO_MDOC) {
+        for (const key in vpToken) {
+            if (CredentialId[key].format === CredentialFormat.MSO_MDOC) {
                 //TODO: Support response with multiple credential formats in the future
-                return this._verifyMsoMdoc(vpToken[key], trustLists, origin, nonce);
+                return this._verifyMsoMdoc(vpToken[key], trustLists, origins, nonce);
             }
         }
         throw new Error('Unsupported credential format');
     }
 
-    async _verifyMsoMdoc(tokens, trustLists, origin, nonce) {
-        const processedDocuments = [];
-        const decodedTokens = [];
-        const documents = [];
-        const claims = {};
-        let trusted = true;
-        let valid = true;
+    async _verifyMsoMdoc(tokens, trustLists, origins, nonce) {
+        // Try each origin until one succeeds
+        let lastError = null;
+        for (const origin of origins) {
+            try {
+                const processedDocuments = [];
+                const decodedTokens = [];
+                const documents = [];
+                const claims = {};
+                let trusted = true;
+                let valid = true;
 
-        // Generate session transcript if origin and nonce are provided
-        const sessionTranscript = await this._generateSessionTranscript(origin, nonce);
+                // Generate session transcript if origin and nonce are provided
+                const sessionTranscript = await this._generateSessionTranscript(origin, nonce);
 
-        for(const token of tokens) {
-            //verify base64url-encoded CBOR data
-            const decoded = await decodeVpToken(token);
-            console.log('decoded', decoded);
-            decodedTokens.push(decoded);
-        }
-        for(const decodedToken of decodedTokens) {
-            documents.push(...decodedToken.documents);
-        }
-        for(const document of documents) {
-            const { claims: documentClaims, issuer, valid: documentValid, invalidReasons } = await verifyDocument(document, sessionTranscript);
-            const issuerTrusted = issuer && (trustLists == ALL_TRUST_LISTS || issuer.certificate.trust_lists.some(tl => trustLists.includes(tl)));
-            trusted = trusted && issuerTrusted;
-            valid = valid && documentValid;
-            for(const key in documentClaims) {
-                claims[key] = documentClaims[key];
+                for (const token of tokens) {
+                    //verify base64url-encoded CBOR data
+                    const decoded = await decodeVpToken(token);
+                    console.log('decoded', decoded);
+                    decodedTokens.push(decoded);
+                }
+                for (const decodedToken of decodedTokens) {
+                    documents.push(...decodedToken.documents);
+                }
+                for (const document of documents) {
+                    const { claims: documentClaims, issuer, valid: documentValid, invalidReasons } = await verifyDocument(document, sessionTranscript);
+                    const issuerTrusted = issuer && (trustLists == ALL_TRUST_LISTS || issuer.certificate.trust_lists.some(tl => trustLists.includes(tl)));
+                    trusted = trusted && issuerTrusted;
+                    valid = valid && documentValid;
+                    for (const key in documentClaims) {
+                        claims[key] = documentClaims[key];
+                    }
+                    const processedDocument = {
+                        claims: documentClaims,
+                        valid: documentValid,
+                        trusted: !!issuerTrusted,
+                        document: document,
+                    };
+                    if (issuer) processedDocument.issuer = issuer;
+                    if (!documentValid) processedDocument.invalidReasons = invalidReasons;
+                    processedDocuments.push(processedDocument);
+                }
+                return {
+                    claims: claims,
+                    valid: !!valid,
+                    trusted: !!trusted,
+                    processedDocuments: processedDocuments,
+                    sessionTranscript: sessionTranscript,
+                };
+            } catch (error) {
+                lastError = error;
+                console.warn(`Verification failed with origin "${origin}":`, error.message);
+                continue;
             }
-            const processedDocument = {
-                claims: documentClaims,
-                valid: documentValid,
-                trusted: !!issuerTrusted,
-                document: document,
-            };
-            if(issuer) processedDocument.issuer = issuer;
-            if(!documentValid) processedDocument.invalidReasons = invalidReasons;
-            processedDocuments.push(processedDocument);
         }
-        return {
-            claims: claims,
-            valid: !!valid,
-            trusted: !!trusted,
-            processedDocuments: processedDocuments,
-            sessionTranscript: sessionTranscript,
-        };
+
+        // If all origins failed, throw the last error
+        throw new Error(`Verification failed for all origins. Last error: ${lastError?.message || 'Unknown error'}`);
     }
 
     async _generateSessionTranscript(origin, nonce, jwkThumbprint = null) {
-        if(!origin) throw new Error('Origin is required for generating session transcript');
-        if(!nonce) throw new Error('Nonce is required for generating session transcript');
+        if (!origin) throw new Error('Origin is required for generating session transcript');
+        if (!nonce) throw new Error('Nonce is required for generating session transcript');
 
         // Create OpenID4VPDCAPIHandoverInfo structure
         const handoverInfo = [origin, nonce, jwkThumbprint];

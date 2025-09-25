@@ -740,16 +740,24 @@ class OpenID4VPProtocolHelper {
     _createQueryCredentials(documentTypes, claims) {
         const credentials = [];
         for (const format of ProtocolFormats[this.protocol]) {
-            for(const documentType of documentTypes) {
+            for (const documentType of documentTypes) {
                 const formatClaims = [];
 
                 // Add claims for this format
                 claims.forEach(claim => {
-                    const claimPath = ClaimMappings[format]?.[documentType]?.[claim];
-                    if (claimPath) {
+                    // Check if claim is already in path format (array)
+                    if (Array.isArray(claim)) {
                         formatClaims.push({
-                            path: claimPath
+                            path: claim
                         });
+                    } else {
+                        // Use claim mapping for standard claim names
+                        const claimPath = ClaimMappings[format]?.[documentType]?.[claim];
+                        if (claimPath) {
+                            formatClaims.push({
+                                path: claimPath
+                            });
+                        }
                     }
                 });
 
@@ -760,13 +768,13 @@ class OpenID4VPProtocolHelper {
                         claims: formatClaims,
                         meta: {},
                     };
-                    if(format === CredentialFormat.MSO_MDOC) {
+                    if (format === CredentialFormat.MSO_MDOC) {
                         //https://openid.net/specs/openid-4-verifiable-presentations-1_0.html#appendix-B.2.3
                         credential.meta.doctype_value = documentType;
-                    } else if(format === CredentialFormat.DC_SD_JWT) {
+                    } else if (format === CredentialFormat.DC_SD_JWT) {
                         //https://openid.net/specs/openid-4-verifiable-presentations-1_0.html#appendix-B.3.5
                         credential.meta.vct_values = [];
-                    } else if(format === CredentialFormat.LDP_VC) {
+                    } else if (format === CredentialFormat.LDP_VC) {
                         //https://openid.net/specs/openid-4-verifiable-presentations-1_0.html#appendix-B.1.1
                         credential.meta.type_values = [];
                     }
@@ -778,67 +786,80 @@ class OpenID4VPProtocolHelper {
         return credentials;
     }
 
-    async verify(credentialData, trustLists, origin, nonce) {
+    async verify(credentialData, trustLists, origins, nonce) {
         const vpToken = credentialData.vp_token;
-        for(const key in vpToken) {
-            if(CredentialId[key].format === CredentialFormat.MSO_MDOC) {
+        for (const key in vpToken) {
+            if (CredentialId[key].format === CredentialFormat.MSO_MDOC) {
                 //TODO: Support response with multiple credential formats in the future
-                return this._verifyMsoMdoc(vpToken[key], trustLists, origin, nonce);
+                return this._verifyMsoMdoc(vpToken[key], trustLists, origins, nonce);
             }
         }
         throw new Error('Unsupported credential format');
     }
 
-    async _verifyMsoMdoc(tokens, trustLists, origin, nonce) {
-        const processedDocuments = [];
-        const decodedTokens = [];
-        const documents = [];
-        const claims = {};
-        let trusted = true;
-        let valid = true;
+    async _verifyMsoMdoc(tokens, trustLists, origins, nonce) {
+        // Try each origin until one succeeds
+        let lastError = null;
+        for (const origin of origins) {
+            try {
+                const processedDocuments = [];
+                const decodedTokens = [];
+                const documents = [];
+                const claims = {};
+                let trusted = true;
+                let valid = true;
 
-        // Generate session transcript if origin and nonce are provided
-        const sessionTranscript = await this._generateSessionTranscript(origin, nonce);
+                // Generate session transcript if origin and nonce are provided
+                const sessionTranscript = await this._generateSessionTranscript(origin, nonce);
 
-        for(const token of tokens) {
-            //verify base64url-encoded CBOR data
-            const decoded = await decodeVpToken(token);
-            console.log('decoded', decoded);
-            decodedTokens.push(decoded);
-        }
-        for(const decodedToken of decodedTokens) {
-            documents.push(...decodedToken.documents);
-        }
-        for(const document of documents) {
-            const { claims: documentClaims, issuer, valid: documentValid, invalidReasons } = await verifyDocument(document, sessionTranscript);
-            const issuerTrusted = issuer && (trustLists == ALL_TRUST_LISTS || issuer.certificate.trust_lists.some(tl => trustLists.includes(tl)));
-            trusted = trusted && issuerTrusted;
-            valid = valid && documentValid;
-            for(const key in documentClaims) {
-                claims[key] = documentClaims[key];
+                for (const token of tokens) {
+                    //verify base64url-encoded CBOR data
+                    const decoded = await decodeVpToken(token);
+                    console.log('decoded', decoded);
+                    decodedTokens.push(decoded);
+                }
+                for (const decodedToken of decodedTokens) {
+                    documents.push(...decodedToken.documents);
+                }
+                for (const document of documents) {
+                    const { claims: documentClaims, issuer, valid: documentValid, invalidReasons } = await verifyDocument(document, sessionTranscript);
+                    const issuerTrusted = issuer && (trustLists == ALL_TRUST_LISTS || issuer.certificate.trust_lists.some(tl => trustLists.includes(tl)));
+                    trusted = trusted && issuerTrusted;
+                    valid = valid && documentValid;
+                    for (const key in documentClaims) {
+                        claims[key] = documentClaims[key];
+                    }
+                    const processedDocument = {
+                        claims: documentClaims,
+                        valid: documentValid,
+                        trusted: !!issuerTrusted,
+                        document: document,
+                    };
+                    if (issuer) processedDocument.issuer = issuer;
+                    if (!documentValid) processedDocument.invalidReasons = invalidReasons;
+                    processedDocuments.push(processedDocument);
+                }
+                return {
+                    claims: claims,
+                    valid: !!valid,
+                    trusted: !!trusted,
+                    processedDocuments: processedDocuments,
+                    sessionTranscript: sessionTranscript,
+                };
+            } catch (error) {
+                lastError = error;
+                console.warn(`Verification failed with origin "${origin}":`, error.message);
+                continue;
             }
-            const processedDocument = {
-                claims: documentClaims,
-                valid: documentValid,
-                trusted: !!issuerTrusted,
-                document: document,
-            };
-            if(issuer) processedDocument.issuer = issuer;
-            if(!documentValid) processedDocument.invalidReasons = invalidReasons;
-            processedDocuments.push(processedDocument);
         }
-        return {
-            claims: claims,
-            valid: !!valid,
-            trusted: !!trusted,
-            processedDocuments: processedDocuments,
-            sessionTranscript: sessionTranscript,
-        };
+
+        // If all origins failed, throw the last error
+        throw new Error(`Verification failed for all origins. Last error: ${lastError?.message || 'Unknown error'}`);
     }
 
     async _generateSessionTranscript(origin, nonce, jwkThumbprint = null) {
-        if(!origin) throw new Error('Origin is required for generating session transcript');
-        if(!nonce) throw new Error('Nonce is required for generating session transcript');
+        if (!origin) throw new Error('Origin is required for generating session transcript');
+        if (!nonce) throw new Error('Nonce is required for generating session transcript');
 
         // Create OpenID4VPDCAPIHandoverInfo structure
         const handoverInfo = [origin, nonce, jwkThumbprint];
@@ -889,13 +910,21 @@ class MDOCProtocolHelper {
         const readerAuthAll = [];//TODO: Waiting on Apple to approve my business connect request so I can test how this works
         const documentSets = [];
         let i = 0;
-        for(const documentType of documentTypes) {
+        for (const documentType of documentTypes) {
             const nameSpaces = {};
 
             claims.forEach(claim => {
-                const claimPath = ClaimMappings[CredentialFormat.MSO_MDOC]?.[documentType]?.[claim];
+                let claimPath;
+                // Check if claim is already in path format (array)
+                if (Array.isArray(claim)) {
+                    claimPath = claim;
+                } else {
+                    // Use claim mapping for standard claim names
+                    claimPath = ClaimMappings[CredentialFormat.MSO_MDOC]?.[documentType]?.[claim];
+                }
+
                 if (claimPath) {
-                    if(!nameSpaces[claimPath[0]]) {
+                    if (!nameSpaces[claimPath[0]]) {
                         nameSpaces[claimPath[0]] = {};
                     }
                     nameSpaces[claimPath[0]][claimPath[1]] = true;
@@ -939,19 +968,33 @@ class MDOCProtocolHelper {
         return bufferToBase64Url(encryptionInfo);
     }
 
-    async verify(credentialData, trustLists, origin, nonce, jwk) {
+    async verify(credentialData, trustLists, origins, nonce, jwk) {
         const response = credentialData.response;
         const decodedResponse = await decodeVpToken(response);
-        if(!Array.isArray(decodedResponse) || decodedResponse[0] !== 'dcapi') {
+        if (!Array.isArray(decodedResponse) || decodedResponse[0] !== 'dcapi') {
             throw new Error('Expected decoded response to be an array with dcapi as first element');
         }
         const { enc, cipherText } = decodedResponse[1] || {};
-        if(!enc || !cipherText) {
+        if (!enc || !cipherText) {
             throw new Error('Expected enc and cipherText in decoded response');
         }
-        const sessionTranscript = await this._generateSessionTranscript(origin, nonce, jwk);
-        const decrypted = await this._decryptCipherText(cipherText, enc, sessionTranscript, jwk);
-        return this._verifyMsoMdoc(decrypted.documents, trustLists, sessionTranscript);
+
+        // Try each origin until one succeeds
+        let lastError = null;
+        for (const origin of origins) {
+            try {
+                const sessionTranscript = await this._generateSessionTranscript(origin, nonce, jwk);
+                const decrypted = await this._decryptCipherText(cipherText, enc, sessionTranscript, jwk);
+                return this._verifyMsoMdoc(decrypted.documents, trustLists, sessionTranscript);
+            } catch (error) {
+                lastError = error;
+                console.warn(`Verification failed with origin "${origin}":`, error.message);
+                continue;
+            }
+        }
+
+        // If all origins failed, throw the last error
+        throw new Error(`Verification failed for all origins. Last error: ${lastError?.message || 'Unknown error'}`);
     }
 
     async _decryptCipherText(cipherText, enc, sessionTranscript, jwk) {
@@ -984,12 +1027,12 @@ class MDOCProtocolHelper {
         let trusted = true;
         let valid = true;
 
-        for(const document of documents) {
+        for (const document of documents) {
             const { claims: documentClaims, issuer, valid: documentValid, invalidReasons } = await verifyDocument(document, sessionTranscript);
             const issuerTrusted = issuer && (trustLists == ALL_TRUST_LISTS || issuer.certificate.trust_lists.some(tl => trustLists.includes(tl)));
             trusted = trusted && issuerTrusted;
             valid = valid && documentValid;
-            for(const key in documentClaims) {
+            for (const key in documentClaims) {
                 claims[key] = documentClaims[key];
             }
             const processedDocument = {
@@ -998,8 +1041,8 @@ class MDOCProtocolHelper {
                 trusted: !!issuerTrusted,
                 document: document,
             };
-            if(issuer) processedDocument.issuer = issuer;
-            if(!documentValid) processedDocument.invalidReasons = invalidReasons;
+            if (issuer) processedDocument.issuer = issuer;
+            if (!documentValid) processedDocument.invalidReasons = invalidReasons;
             processedDocuments.push(processedDocument);
         }
         return {
@@ -1012,9 +1055,9 @@ class MDOCProtocolHelper {
     }
 
     async _generateSessionTranscript(origin, nonceHex, jwk) {
-        if(!origin) throw new Error('Origin is required for generating session transcript');
-        if(!nonceHex) throw new Error('Nonce is required for generating session transcript');
-        if(!jwk) throw new Error('JWK is required for generating session transcript');
+        if (!origin) throw new Error('Origin is required for generating session transcript');
+        if (!nonceHex) throw new Error('Nonce is required for generating session transcript');
+        if (!jwk) throw new Error('JWK is required for generating session transcript');
 
         const nonce = new Uint8Array(nonceHex.length / 2);
         for (let i = 0; i < nonceHex.length; i += 2) {
@@ -1073,21 +1116,14 @@ const createCredentialsRequest = (options = {}) => {
         throw new Error(`Invalid document types: ${invalidTypes.join(', ')}`);
     }
 
-    // Validate claims
-    const validClaims = Object.values(Claim);
-    const invalidClaims = claims.filter(claim => !validClaims.includes(claim));
-    if (invalidClaims.length > 0) {
-        throw new Error(`Invalid claims: ${invalidClaims.join(', ')}`);
-    }
-
     // Create requests for both protocols
     const requests = [];
 
     for (const protocol of Object.values(Protocol)) {
         let request;
-        if(protocol === Protocol.OPENID4VP) {
+        if (protocol === Protocol.OPENID4VP) {
             request = openid4vpProtocolHelper.createRequest(types, claims, nonce);
-        } else if(protocol === Protocol.MDOC) {
+        } else if (protocol === Protocol.MDOC) {
             request = mdocProtocolHelper.createRequest(types, claims, nonce, jwk);
         }
         if (request) requests.push(request);
@@ -1167,7 +1203,7 @@ const requestCredentials = async (requestParams, options = {}) => {
  * @param {Object} credentials - The credentials response from requestCredentials
  * @param {Object} params - Verification params
  * @param {Array<string>} params.trustLists - Names of trust lists to use for determining trust. Defaults to all
- * @param {string} params.origin - The origin of the request (for session transcript generation)
+ * @param {string|string[]} params.origin - The origin(s) of the request (for session transcript generation). Can be a single origin or array of origins to try.
  * @param {string} params.nonce - The nonce from the original request (for session transcript generation)
  * @param {Object} params.jwk - The JWK used to encrypt the request
  * @returns {Promise<Object>} Promise that resolves to the processed credential information
@@ -1185,10 +1221,13 @@ const processCredentials = async (credentials, params = {}) => {
     if (!credentials.data)
         throw new Error('Credential response missing data');
 
-    if(credentials.protocol === Protocol.OPENID4VP) {
-        return await openid4vpProtocolHelper.verify(credentials.data, trustLists, origin, nonce);
-    } else if(credentials.protocol === Protocol.MDOC) {
-        return await mdocProtocolHelper.verify(credentials.data, trustLists, origin, nonce, jwk);
+    // Convert single origin to array, or use provided array
+    const origins = Array.isArray(origin) ? origin : (origin ? [origin] : [null]);
+
+    if (credentials.protocol === Protocol.OPENID4VP) {
+        return await openid4vpProtocolHelper.verify(credentials.data, trustLists, origins, nonce);
+    } else if (credentials.protocol === Protocol.MDOC) {
+        return await mdocProtocolHelper.verify(credentials.data, trustLists, origins, nonce, jwk);
     } else {
         throw new Error(`Unsupported protocol: ${credentials.protocol}`);
     }

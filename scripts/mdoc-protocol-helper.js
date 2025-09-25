@@ -36,13 +36,21 @@ class MDOCProtocolHelper {
         const readerAuthAll = [];//TODO: Waiting on Apple to approve my business connect request so I can test how this works
         const documentSets = [];
         let i = 0;
-        for(const documentType of documentTypes) {
+        for (const documentType of documentTypes) {
             const nameSpaces = {};
 
             claims.forEach(claim => {
-                const claimPath = ClaimMappings[CredentialFormat.MSO_MDOC]?.[documentType]?.[claim];
+                let claimPath;
+                // Check if claim is already in path format (array)
+                if (Array.isArray(claim)) {
+                    claimPath = claim;
+                } else {
+                    // Use claim mapping for standard claim names
+                    claimPath = ClaimMappings[CredentialFormat.MSO_MDOC]?.[documentType]?.[claim];
+                }
+
                 if (claimPath) {
-                    if(!nameSpaces[claimPath[0]]) {
+                    if (!nameSpaces[claimPath[0]]) {
                         nameSpaces[claimPath[0]] = {};
                     }
                     nameSpaces[claimPath[0]][claimPath[1]] = true;
@@ -86,19 +94,33 @@ class MDOCProtocolHelper {
         return bufferToBase64Url(encryptionInfo);
     }
 
-    async verify(credentialData, trustLists, origin, nonce, jwk) {
+    async verify(credentialData, trustLists, origins, nonce, jwk) {
         const response = credentialData.response;
         const decodedResponse = await decodeVpToken(response);
-        if(!Array.isArray(decodedResponse) || decodedResponse[0] !== 'dcapi') {
+        if (!Array.isArray(decodedResponse) || decodedResponse[0] !== 'dcapi') {
             throw new Error('Expected decoded response to be an array with dcapi as first element');
         }
         const { enc, cipherText } = decodedResponse[1] || {};
-        if(!enc || !cipherText) {
+        if (!enc || !cipherText) {
             throw new Error('Expected enc and cipherText in decoded response');
         }
-        const sessionTranscript = await this._generateSessionTranscript(origin, nonce, jwk);
-        const decrypted = await this._decryptCipherText(cipherText, enc, sessionTranscript, jwk);
-        return this._verifyMsoMdoc(decrypted.documents, trustLists, sessionTranscript);
+
+        // Try each origin until one succeeds
+        let lastError = null;
+        for (const origin of origins) {
+            try {
+                const sessionTranscript = await this._generateSessionTranscript(origin, nonce, jwk);
+                const decrypted = await this._decryptCipherText(cipherText, enc, sessionTranscript, jwk);
+                return this._verifyMsoMdoc(decrypted.documents, trustLists, sessionTranscript);
+            } catch (error) {
+                lastError = error;
+                console.warn(`Verification failed with origin "${origin}":`, error.message);
+                continue;
+            }
+        }
+
+        // If all origins failed, throw the last error
+        throw new Error(`Verification failed for all origins. Last error: ${lastError?.message || 'Unknown error'}`);
     }
 
     async _decryptCipherText(cipherText, enc, sessionTranscript, jwk) {
@@ -131,12 +153,12 @@ class MDOCProtocolHelper {
         let trusted = true;
         let valid = true;
 
-        for(const document of documents) {
+        for (const document of documents) {
             const { claims: documentClaims, issuer, valid: documentValid, invalidReasons } = await verifyDocument(document, sessionTranscript);
             const issuerTrusted = issuer && (trustLists == ALL_TRUST_LISTS || issuer.certificate.trust_lists.some(tl => trustLists.includes(tl)));
             trusted = trusted && issuerTrusted;
             valid = valid && documentValid;
-            for(const key in documentClaims) {
+            for (const key in documentClaims) {
                 claims[key] = documentClaims[key];
             }
             const processedDocument = {
@@ -145,8 +167,8 @@ class MDOCProtocolHelper {
                 trusted: !!issuerTrusted,
                 document: document,
             };
-            if(issuer) processedDocument.issuer = issuer;
-            if(!documentValid) processedDocument.invalidReasons = invalidReasons;
+            if (issuer) processedDocument.issuer = issuer;
+            if (!documentValid) processedDocument.invalidReasons = invalidReasons;
             processedDocuments.push(processedDocument);
         }
         return {
@@ -159,9 +181,9 @@ class MDOCProtocolHelper {
     }
 
     async _generateSessionTranscript(origin, nonceHex, jwk) {
-        if(!origin) throw new Error('Origin is required for generating session transcript');
-        if(!nonceHex) throw new Error('Nonce is required for generating session transcript');
-        if(!jwk) throw new Error('JWK is required for generating session transcript');
+        if (!origin) throw new Error('Origin is required for generating session transcript');
+        if (!nonceHex) throw new Error('Nonce is required for generating session transcript');
+        if (!jwk) throw new Error('JWK is required for generating session transcript');
 
         const nonce = new Uint8Array(nonceHex.length / 2);
         for (let i = 0; i < nonceHex.length; i += 2) {
