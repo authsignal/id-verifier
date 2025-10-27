@@ -14,7 +14,7 @@ const ALL_TRUST_LISTS = ['all_trust_lists'];
  * Supported document types for common identification documents
  */
 const DocumentType = {
-    PHOTO_ID: 'org.iso.23220.photoid.1',
+    PHOTO_ID: 'org.iso.23220.photoID.1',
     EU_PERSONAL_ID: 'eu.europa.ec.eudi.pid.1',
     JAPAN_MY_NUMBER_CARD: 'org.iso.23220.1.jp.mnc',
     MOBILE_DRIVERS_LICENSE: 'org.iso.18013.5.1.mDL',
@@ -49,7 +49,7 @@ const createCredentialId = (format, documentType) => {
 };
 
 const CredentialId = {
-    'cred-mso_mdoc-org_iso_23220_photoid_1': { format: CredentialFormat.MSO_MDOC, documentType: DocumentType.PHOTO_ID },
+    'cred-mso_mdoc-org_iso_23220_photoID_1': { format: CredentialFormat.MSO_MDOC, documentType: DocumentType.PHOTO_ID },
     'cred-mso_mdoc-eu_europa_ec_eudi_pid_1': { format: CredentialFormat.MSO_MDOC, documentType: DocumentType.EU_PERSONAL_ID },
     'cred-mso_mdoc-org_iso_23220_1_jp_mnc': { format: CredentialFormat.MSO_MDOC, documentType: DocumentType.JAPAN_MY_NUMBER_CARD },
     'cred-mso_mdoc-org_iso_18013_5_1_mDL': { format: CredentialFormat.MSO_MDOC, documentType: DocumentType.MOBILE_DRIVERS_LICENSE },
@@ -92,8 +92,8 @@ const Claim = {
 const ClaimMappings = {
     [CredentialFormat.MSO_MDOC]: {
         [DocumentType.PHOTO_ID]: {
-            [Claim.GIVEN_NAME]: ['org.iso.23220.1', 'given_name_unicode'],
-            [Claim.FAMILY_NAME]: ['org.iso.23220.1', 'family_name_unicode'],
+            [Claim.GIVEN_NAME]: ['org.iso.23220.1', 'given_name'],
+            [Claim.FAMILY_NAME]: ['org.iso.23220.1', 'family_name'],
             [Claim.BIRTH_DATE]: ['org.iso.23220.1', 'birth_date'],
             [Claim.BIRTH_YEAR]: ['org.iso.23220.1', 'age_birth_year'],
             [Claim.AGE]: ['org.iso.23220.1', 'age_in_years'],
@@ -215,11 +215,11 @@ const ClaimMappings = {
 };
 
 const REVERSE_CLAIM_MAPPINGS = {};
-for(const format in ClaimMappings) {
+for (const format in ClaimMappings) {
     REVERSE_CLAIM_MAPPINGS[format] = {};
-    for(const documentType in ClaimMappings[format]) {
+    for (const documentType in ClaimMappings[format]) {
         REVERSE_CLAIM_MAPPINGS[format][documentType] = {};
-        for(const claim in ClaimMappings[format][documentType]) {
+        for (const claim in ClaimMappings[format][documentType]) {
             let mappedValue = ClaimMappings[format][documentType][claim];
             mappedValue = mappedValue[mappedValue.length - 1];
             REVERSE_CLAIM_MAPPINGS[format][documentType][mappedValue] = claim;
@@ -228,13 +228,13 @@ for(const format in ClaimMappings) {
 }
 
 const CoseAlgToWebCrypto = {
-    [-7]:   { name: 'ECDSA', hash: 'SHA-256', namedCurve: 'P-256' },       // ES256
-    [-35]:  { name: 'ECDSA', hash: 'SHA-384', namedCurve: 'P-384' },       // ES384
-    [-36]:  { name: 'ECDSA', hash: 'SHA-512', namedCurve: 'P-521' },       // ES512
+    [-7]: { name: 'ECDSA', hash: 'SHA-256', namedCurve: 'P-256' },       // ES256
+    [-35]: { name: 'ECDSA', hash: 'SHA-384', namedCurve: 'P-384' },       // ES384
+    [-36]: { name: 'ECDSA', hash: 'SHA-512', namedCurve: 'P-521' },       // ES512
 
-    [-37]:  { name: 'RSASSA-PSS', hash: 'SHA-256' },                       // PS256
-    [-38]:  { name: 'RSASSA-PSS', hash: 'SHA-384' },                       // PS384
-    [-39]:  { name: 'RSASSA-PSS', hash: 'SHA-512' },                       // PS512
+    [-37]: { name: 'RSASSA-PSS', hash: 'SHA-256' },                       // PS256
+    [-38]: { name: 'RSASSA-PSS', hash: 'SHA-384' },                       // PS384
+    [-39]: { name: 'RSASSA-PSS', hash: 'SHA-512' },                       // PS512
 
     [-257]: { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },                // RS256
     [-258]: { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-384' },                // RS384
@@ -910,6 +910,7 @@ class MDOCProtocolHelper {
         const readerAuthAll = [];//TODO: Waiting on Apple to approve my business connect request so I can test how this works
         const documentSets = [];
         let i = 0;
+
         for (const documentType of documentTypes) {
             const nameSpaces = {};
 
@@ -942,18 +943,21 @@ class MDOCProtocolHelper {
                 documentSets.push([i++]);
             }
         }
-        const deviceRequestInfo = new cbor2.Tag(24, cbor2.encode({
+        const deviceRequestInfo = {
             useCases: [{
                 mandatory: true,
                 documentSets: documentSets,
             }]
-        }));
-        return bufferToBase64Url(cbor2.encode({
+        };
+
+        const fullDeviceRequest = {
             version: version,
             docRequests: docRequests,
             readerAuthAll: readerAuthAll,
             deviceRequestInfo: deviceRequestInfo,
-        }));
+        };
+
+        return bufferToBase64Url(cbor2.encode(fullDeviceRequest));
     }
 
     _createEncryptionInfo(nonceHex, jwk) {

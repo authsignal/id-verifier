@@ -36,6 +36,7 @@ class MDOCProtocolHelper {
         const readerAuthAll = [];//TODO: Waiting on Apple to approve my business connect request so I can test how this works
         const documentSets = [];
         let i = 0;
+
         for (const documentType of documentTypes) {
             const nameSpaces = {};
 
@@ -68,18 +69,21 @@ class MDOCProtocolHelper {
                 documentSets.push([i++]);
             }
         }
-        const deviceRequestInfo = new cbor2.Tag(24, cbor2.encode({
+        const deviceRequestInfo = {
             useCases: [{
                 mandatory: true,
                 documentSets: documentSets,
             }]
-        }));
-        return bufferToBase64Url(cbor2.encode({
+        };
+
+        const fullDeviceRequest = {
             version: version,
             docRequests: docRequests,
             readerAuthAll: readerAuthAll,
             deviceRequestInfo: deviceRequestInfo,
-        }));
+        };
+
+        return bufferToBase64Url(cbor2.encode(fullDeviceRequest));
     }
 
     _createEncryptionInfo(nonceHex, jwk) {
