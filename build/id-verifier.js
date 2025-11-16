@@ -1179,6 +1179,8 @@ const requestCredentials = async (requestParams, options = {}) => {
             signal: AbortSignal.timeout(timeout)
         };
 
+        console.log("DCAPI Request Options:", JSON.stringify(credentialRequestOptions, null, 2));
+
         // Request the credential
         const credential = await navigator.credentials.get(credentialRequestOptions);
 
