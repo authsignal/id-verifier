@@ -943,12 +943,19 @@ class MDOCProtocolHelper {
                 documentSets.push([i++]);
             }
         }
-        const deviceRequestInfo = {
+        // const deviceRequestInfo = {
+        //     useCases: [{
+        //         mandatory: true,
+        //         documentSets: documentSets,
+        //     }]
+        // };
+
+        const deviceRequestInfo = new cbor2.Tag(24, cbor2.encode({
             useCases: [{
                 mandatory: true,
                 documentSets: documentSets,
             }]
-        };
+        }));
 
         const fullDeviceRequest = {
             version: version,
@@ -1166,9 +1173,11 @@ const requestCredentials = async (requestParams, options = {}) => {
     //filter out requests that are not supported by the browser
     requestParams.digital.requests = requestParams.digital.requests.filter(request => {
         //TODO: Replace with DigitalCredentials.userAgentAllowsProtocol(request.protocol) once the API is available
-        // const allowedProtocol = navigator.userAgent.includes('Safari') ? Protocol.MDOC : Protocol.OPENID4VP;
-        return request.protocol === Protocol.OPENID4VP;
-        //return DigitalCredential.userAgentAllowsProtocol(request.protocol);
+        const allowedProtocol = navigator.userAgent.includes('Safari') ? Protocol.MDOC : Protocol.OPENID4VP;
+        return request.protocol === allowedProtocol;
+
+        // return request.protocol === Protocol.OPENID4VP;
+        // return DigitalCredential.userAgentAllowsProtocol(request.protocol);
     }).slice(0, 1);
 
     try {
@@ -1179,7 +1188,7 @@ const requestCredentials = async (requestParams, options = {}) => {
             signal: AbortSignal.timeout(timeout)
         };
 
-        console.log("DCAPI Request Options:", JSON.stringify(credentialRequestOptions, null, 2));
+        console.log('DCAPI Request Options:', JSON.stringify(credentialRequestOptions, null, 2));
 
         // Request the credential
         const credential = await navigator.credentials.get(credentialRequestOptions);
