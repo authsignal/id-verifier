@@ -69,12 +69,6 @@ class MDOCProtocolHelper {
                 documentSets.push([i++]);
             }
         }
-        // const deviceRequestInfo = {
-        //     useCases: [{
-        //         mandatory: true,
-        //         documentSets: documentSets,
-        //     }]
-        // };
 
         const deviceRequestInfo = new cbor2.Tag(24, cbor2.encode({
             useCases: [{

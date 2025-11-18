@@ -81,12 +81,13 @@ export const requestCredentials = async (requestParams, options = {}) => {
 
     //filter out requests that are not supported by the browser
     requestParams.digital.requests = requestParams.digital.requests.filter(request => {
-        //TODO: Replace with DigitalCredentials.userAgentAllowsProtocol(request.protocol) once the API is available
-        const allowedProtocol = navigator.userAgent.includes('Safari') ? Protocol.MDOC : Protocol.OPENID4VP;
-        return request.protocol === allowedProtocol;
+        const isSafari = navigator.userAgent.includes('Safari') && !navigator.userAgent.includes('Chrome');
 
-        // return request.protocol === Protocol.OPENID4VP;
-        // return DigitalCredential.userAgentAllowsProtocol(request.protocol);
+        if (isSafari) {
+            return request.protocol === Protocol.MDOC;
+        }
+
+        return true;
     }).slice(0, 1);
 
     try {
