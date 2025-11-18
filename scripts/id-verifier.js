@@ -88,7 +88,7 @@ export const requestCredentials = async (requestParams, options = {}) => {
         }
 
         return true;
-    }).slice(0, 1);
+    });
 
     try {
         // Create the credential request options following the official spec
