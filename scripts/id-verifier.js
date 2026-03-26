@@ -1,7 +1,9 @@
-import { DocumentType, Protocol, CredentialFormat, ProtocolFormats, Claim, ALL_TRUST_LISTS } from './constants.js';
+import { DocumentType, Protocol, CredentialFormat, ProtocolFormats, Claim, ALL_TRUST_LISTS, ResponseMode, ClientIdPrefix, WalletScheme } from './constants.js';
 import { setTestDataUsage } from './trusted-issuer-registry-helper.js';
 import OpenID4VPProtocolHelper from './openid-4vp-protocol-helper.js';
 import MDOCProtocolHelper from './mdoc-protocol-helper.js';
+import OID4VPRedirectHelper from './oid4vp-redirect-helper.js';
+import { generateX509Hash, certToPemChain } from './x509-helper.js';
 
 /**
  * Digital Credentials API Wrapper
@@ -188,11 +190,79 @@ export const generateJWK = async () => {
     return jwk;
 };
 
+/**
+ * Create an OID4VP authorization request URL for wallet redirect.
+ * @param {Object} options - { clientId, requestUri, walletScheme?, requestUriMethod? }
+ * @returns {string} Authorization request URL
+ */
+export const createAuthorizationRequestUrl = (options) => {
+    return OID4VPRedirectHelper.createAuthorizationRequestUrl(options);
+};
+
+/**
+ * Create a signed JWT Request Object for the request_uri endpoint.
+ * @param {Object} options - See OID4VPRedirectHelper.createRequestObject
+ * @returns {Promise<string>} Signed JWT request object
+ */
+export const createRequestObject = async (options) => {
+    return OID4VPRedirectHelper.createRequestObject(options);
+};
+
+/**
+ * Process a wallet's direct_post or direct_post.jwt response.
+ * @param {Object} options - { responseBody, encryptionJwk? }
+ * @returns {Promise<Object>} { vpToken, state }
+ */
+export const processDirectPostResponse = async (options) => {
+    return OID4VPRedirectHelper.processDirectPostResponse(options);
+};
+
+/**
+ * Verify mdoc credentials from an OID4VP redirect flow response.
+ * @param {Object} options - See OID4VPRedirectHelper.verify
+ * @returns {Promise<Object>} { claims, valid, trusted, processedDocuments, sessionTranscript }
+ */
+export const verifyRedirectResponse = async (options) => {
+    return OID4VPRedirectHelper.verify(options);
+};
+
+/**
+ * Compute the JWK SHA-256 Thumbprint per RFC 7638.
+ * @param {Object} jwk - Public JWK
+ * @returns {Promise<Uint8Array>} 32-byte SHA-256 thumbprint
+ */
+export const computeJwkThumbprint = async (jwk) => {
+    return OID4VPRedirectHelper.computeJwkThumbprint(jwk);
+};
+
+/**
+ * Parse the wallet's POST body from request_uri_method=post negotiation.
+ * @param {string} body - URL-encoded form body
+ * @returns {Object} { walletMetadata, walletNonce }
+ */
+export const parseWalletPost = (body) => {
+    return OID4VPRedirectHelper.parseWalletPost(body);
+};
+
+/**
+ * Create the verifier's response to a wallet direct_post.
+ * @param {Object} options - { redirectUri? }
+ * @returns {Object} HTTP 200 response body
+ */
+export const createDirectPostSuccessResponse = (options) => {
+    return OID4VPRedirectHelper.createDirectPostSuccessResponse(options);
+};
+
 export {
     DocumentType,
     Protocol,
     CredentialFormat,
     ProtocolFormats,
     Claim,
-    setTestDataUsage
+    setTestDataUsage,
+    ResponseMode,
+    ClientIdPrefix,
+    WalletScheme,
+    generateX509Hash,
+    certToPemChain,
 };
