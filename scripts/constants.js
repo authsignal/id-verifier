@@ -41,6 +41,32 @@ export const ProtocolFormats = {
     [Protocol.MDOC]: [CredentialFormat.MSO_MDOC]
 };
 
+/**
+ * OID4VP Response Modes
+ */
+export const ResponseMode = {
+    DC_API: 'dc_api',
+    DIRECT_POST: 'direct_post',
+    DIRECT_POST_JWT: 'direct_post.jwt',
+};
+
+/**
+ * OID4VP Client Identifier Prefixes
+ */
+export const ClientIdPrefix = {
+    X509_HASH: 'x509_hash',
+    X509_SAN_DNS: 'x509_san_dns',
+    REDIRECT_URI: 'redirect_uri',
+};
+
+/**
+ * Default wallet URL schemes for OID4VP authorization requests
+ */
+export const WalletScheme = {
+    OPENID4VP: 'openid4vp://',
+    MDOC_OPENID4VP: 'mdoc-openid4vp://',
+};
+
 export const createCredentialId = (format, documentType) => {
     //replace all non-alphanumeric characters with an underscore
     return `cred-${format.replace(/[^a-zA-Z0-9]/g, '_')}-${documentType.replace(/[^a-zA-Z0-9]/g, '_')}`;

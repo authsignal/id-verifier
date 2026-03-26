@@ -41,6 +41,7 @@
     "@hpke/core": "^1.7.3",
     "asn1js": "^3.0.6",
     "cbor2": "^2.0.1",
+    "jose": "^6.2.2",
     "pkijs": "^3.2.5",
     "trusted-issuer-registry": "^0.1.0"
   },
