@@ -341,3 +341,60 @@ test('processDirectPostResponse handles unencrypted direct_post', async () => {
     assert.deepEqual(result.vpToken, vpTokenPayload, 'vpToken should be parsed from JSON string');
     assert.equal(result.state, 'plain-state', 'state should match');
 });
+
+// Test 13: verify method exists and throws on invalid DeviceResponse data
+test('verify method exists and throws on invalid DeviceResponse data', async () => {
+    const encKeyPair = await crypto.subtle.generateKey(
+        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']
+    );
+    const encPublicJwk = await crypto.subtle.exportKey('jwk', encKeyPair.publicKey);
+
+    try {
+        await oid4vpRedirectHelper.verify({
+            vpToken: { 'cred-mso_mdoc-org_iso_18013_5_1_mDL': ['aW52YWxpZA'] },
+            clientId: 'x509_hash:testhash',
+            nonce: 'test-nonce',
+            responseUri: 'https://example.com/response',
+            encryptionJwk: encPublicJwk,
+            trustLists: ['all_trust_lists'],
+        });
+        assert.fail('Should have thrown on invalid DeviceResponse');
+    } catch (error) {
+        assert.ok(error, 'Should throw on invalid DeviceResponse data');
+    }
+});
+
+// Test 14: parseWalletPost extracts wallet_metadata and wallet_nonce
+test('parseWalletPost extracts wallet_metadata and wallet_nonce', () => {
+    const body = 'wallet_metadata=%7B%22vp_formats_supported%22%3A%7B%22mso_mdoc%22%3A%7B%7D%7D%7D&wallet_nonce=abc123xyz';
+    const result = oid4vpRedirectHelper.parseWalletPost(body);
+    assert.ok(result.walletMetadata);
+    assert.equal(result.walletMetadata.vp_formats_supported.mso_mdoc !== undefined, true);
+    assert.equal(result.walletNonce, 'abc123xyz');
+});
+
+// Test 15: parseWalletPost handles missing wallet_nonce
+test('parseWalletPost handles missing wallet_nonce', () => {
+    const body = 'wallet_metadata=%7B%22vp_formats_supported%22%3A%7B%7D%7D';
+    const result = oid4vpRedirectHelper.parseWalletPost(body);
+    assert.ok(result.walletMetadata);
+    assert.equal(result.walletNonce, undefined);
+});
+
+// Test 16: createDirectPostSuccessResponse returns redirect_uri with response_code
+test('createDirectPostSuccessResponse returns redirect_uri with response_code', () => {
+    const result = oid4vpRedirectHelper.createDirectPostSuccessResponse({
+        redirectUri: 'https://verifier.example.com/callback',
+    });
+    assert.ok(result.redirect_uri);
+    assert.ok(result.redirect_uri.includes('response_code='));
+    const url = new URL(result.redirect_uri);
+    const responseCode = url.searchParams.get('response_code');
+    assert.ok(responseCode.length >= 16, 'response_code should be sufficiently random');
+});
+
+// Test 17: createDirectPostSuccessResponse omits redirect_uri for cross-device
+test('createDirectPostSuccessResponse omits redirect_uri for cross-device', () => {
+    const result = oid4vpRedirectHelper.createDirectPostSuccessResponse({});
+    assert.equal(result.redirect_uri, undefined);
+});

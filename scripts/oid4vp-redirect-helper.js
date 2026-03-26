@@ -1,6 +1,7 @@
-import { WalletScheme, CredentialFormat, ResponseMode, createCredentialId } from './constants.js';
+import { WalletScheme, CredentialFormat, ResponseMode, createCredentialId, CredentialId, ALL_TRUST_LISTS } from './constants.js';
 import * as cbor2 from 'cbor2';
 import { signRequestObject, decryptJweResponse } from './jwt-helper.js';
+import { decodeVpToken, verifyDocument } from './formats/mdoc-helper.js';
 
 class OID4VPRedirectHelper {
     /**
@@ -136,6 +137,96 @@ class OID4VPRedirectHelper {
         }
 
         return signRequestObject(payload, privateKey, x5cChain);
+    }
+
+    /**
+     * Full verification pipeline for redirect flow mdoc responses.
+     *
+     * @param {object} options
+     * @param {object} options.vpToken - Map of credentialId to array of base64url-encoded tokens
+     * @param {string} options.clientId
+     * @param {string} options.nonce
+     * @param {string} options.responseUri
+     * @param {object} [options.encryptionJwk] - Public JWK used for encryption (to compute thumbprint)
+     * @param {string[]} [options.trustLists] - Trust list identifiers; defaults to ALL_TRUST_LISTS
+     * @returns {Promise<{ claims, valid, trusted, processedDocuments, sessionTranscript }>}
+     */
+    async verify({ vpToken, clientId, nonce, responseUri, encryptionJwk, trustLists = ALL_TRUST_LISTS }) {
+        const jwkThumbprint = encryptionJwk
+            ? await this.computeJwkThumbprint(encryptionJwk)
+            : null;
+
+        const sessionTranscript = await this._generateSessionTranscript(clientId, nonce, jwkThumbprint, responseUri);
+
+        const allClaims = {};
+        let valid = true;
+        let trusted = true;
+        const processedDocuments = [];
+
+        for (const credentialKey of Object.keys(vpToken)) {
+            const credInfo = CredentialId[credentialKey];
+            if (!credInfo || credInfo.format !== CredentialFormat.MSO_MDOC) {
+                throw new Error(`Unsupported credential format for key: ${credentialKey}`);
+            }
+
+            const tokens = vpToken[credentialKey];
+            for (const token of tokens) {
+                const decoded = await decodeVpToken(token);
+                for (const doc of decoded.documents) {
+                    const { claims, issuer, valid: docValid, invalidReasons } = await verifyDocument(doc, sessionTranscript);
+
+                    Object.assign(allClaims, claims);
+
+                    if (!docValid) valid = false;
+
+                    const issuerTrusted = issuer && (
+                        trustLists === ALL_TRUST_LISTS ||
+                        (Array.isArray(trustLists) && trustLists.includes('all_trust_lists')) ||
+                        issuer.certificate?.trust_lists?.some(tl => trustLists.includes(tl))
+                    );
+                    if (!issuerTrusted) trusted = false;
+
+                    processedDocuments.push({ claims, issuer, valid: docValid, trusted: !!issuerTrusted, invalidReasons });
+                }
+            }
+        }
+
+        return { claims: allClaims, valid, trusted, processedDocuments, sessionTranscript };
+    }
+
+    /**
+     * Parses the wallet's POST body from request_uri_method=post negotiation.
+     *
+     * @param {string} body - URL-encoded form string (application/x-www-form-urlencoded)
+     * @returns {{ walletMetadata: Object, walletNonce: string|undefined }}
+     */
+    parseWalletPost(body) {
+        const params = new URLSearchParams(body);
+        const walletMetadataRaw = params.get('wallet_metadata');
+        const walletNonce = params.get('wallet_nonce') ?? undefined;
+        const walletMetadata = walletMetadataRaw ? JSON.parse(walletMetadataRaw) : undefined;
+        return { walletMetadata, walletNonce };
+    }
+
+    /**
+     * Builds the HTTP 200 response for the wallet after receiving direct_post.
+     *
+     * @param {object} options
+     * @param {string} [options.redirectUri] - Present for same-device flow; absent for cross-device
+     * @returns {{ redirect_uri?: string }}
+     */
+    createDirectPostSuccessResponse({ redirectUri } = {}) {
+        if (redirectUri) {
+            const responseCodeBytes = new Uint8Array(24);
+            crypto.getRandomValues(responseCodeBytes);
+            const responseCode = Array.from(responseCodeBytes)
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join('');
+            const url = new URL(redirectUri);
+            url.searchParams.set('response_code', responseCode);
+            return { redirect_uri: url.toString() };
+        }
+        return {};
     }
 
     /**
