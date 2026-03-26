@@ -127,11 +127,13 @@ class OID4VPRedirectHelper {
         }
 
         if (encryptionJwk) {
+            // Strip private key material — only embed public key in the JWT payload
+            const { d, dp, dq, qi, ...publicJwk } = encryptionJwk;
             payload.client_metadata = {
                 encrypted_response_alg_values_supported: ['ECDH-ES'],
                 encrypted_response_enc_values_supported: ['A256GCM', 'A128GCM'],
                 jwks: {
-                    keys: [{ ...encryptionJwk, use: 'enc', kid: 'ephemeral-enc-key' }],
+                    keys: [{ ...publicJwk, use: 'enc', kid: 'ephemeral-enc-key' }],
                 },
             };
         }
@@ -224,7 +226,7 @@ class OID4VPRedirectHelper {
                 .join('');
             const url = new URL(redirectUri);
             url.searchParams.set('response_code', responseCode);
-            return { redirect_uri: url.toString() };
+            return { redirect_uri: url.toString(), response_code: responseCode };
         }
         return {};
     }
@@ -241,7 +243,10 @@ class OID4VPRedirectHelper {
         let vpToken;
         let state;
 
-        if (responseBody.response && encryptionJwk) {
+        if (responseBody.response) {
+            if (!encryptionJwk) {
+                throw new Error('encryptionJwk is required to decrypt a direct_post.jwt response');
+            }
             // direct_post.jwt — decrypt the JWE
             const decrypted = await decryptJweResponse(responseBody.response, encryptionJwk);
             vpToken = typeof decrypted.vp_token === 'string'

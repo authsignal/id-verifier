@@ -34,6 +34,6 @@ export const derToPem = (derBytes) => {
  * @param {Uint8Array[]} derCerts - Array of DER-encoded certificate bytes
  * @returns {string[]} - Array of base64-encoded certificate strings
  */
-export const certToPemChain = (derCerts) => {
+export const certToX5cChain = (derCerts) => {
     return derCerts.map(derBytes => bufferToBase64(derBytes));
 };

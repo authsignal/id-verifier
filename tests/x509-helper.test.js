@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { generateX509Hash, derToPem, certToPemChain } from '../scripts/x509-helper.js';
+import { generateX509Hash, derToPem, certToX5cChain } from '../scripts/x509-helper.js';
 
 async function generateTestCertDer() {
     const { Certificate } = await import('pkijs');
@@ -67,10 +67,10 @@ test('derToPem wraps bytes in proper PEM armoring', async () => {
     }
 });
 
-test('certToPemChain returns base64 strings (not PEM armored)', async () => {
+test('certToX5cChain returns base64 strings (not PEM armored)', async () => {
     const certDer1 = await generateTestCertDer();
     const certDer2 = await generateTestCertDer();
-    const chain = certToPemChain([certDer1, certDer2]);
+    const chain = certToX5cChain([certDer1, certDer2]);
 
     assert.equal(chain.length, 2, 'chain should have 2 entries');
 

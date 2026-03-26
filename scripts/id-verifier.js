@@ -3,7 +3,7 @@ import { setTestDataUsage } from './trusted-issuer-registry-helper.js';
 import OpenID4VPProtocolHelper from './openid-4vp-protocol-helper.js';
 import MDOCProtocolHelper from './mdoc-protocol-helper.js';
 import OID4VPRedirectHelper from './oid4vp-redirect-helper.js';
-import { generateX509Hash, certToPemChain } from './x509-helper.js';
+import { generateX509Hash, certToX5cChain } from './x509-helper.js';
 
 /**
  * Digital Credentials API Wrapper
@@ -264,5 +264,5 @@ export {
     ClientIdPrefix,
     WalletScheme,
     generateX509Hash,
-    certToPemChain,
+    certToX5cChain,
 };
