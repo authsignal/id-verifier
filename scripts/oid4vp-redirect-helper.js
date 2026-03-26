@@ -1,5 +1,6 @@
-import { WalletScheme } from './constants.js';
+import { WalletScheme, CredentialFormat, ResponseMode, createCredentialId } from './constants.js';
 import * as cbor2 from 'cbor2';
+import { signRequestObject, decryptJweResponse } from './jwt-helper.js';
 
 class OID4VPRedirectHelper {
     /**
@@ -79,6 +80,92 @@ class OID4VPRedirectHelper {
         const encoded = new TextEncoder().encode(json);
         const hashBuffer = await crypto.subtle.digest('SHA-256', encoded);
         return new Uint8Array(hashBuffer);
+    }
+
+    /**
+     * Creates a signed OID4VP request object JWT.
+     *
+     * @param {object} options
+     * @param {string} options.clientId
+     * @param {string} options.nonce
+     * @param {string} options.state
+     * @param {string} options.responseUri
+     * @param {string[]} options.documentTypes
+     * @param {string[]} options.claims
+     * @param {import('jose').KeyLike} options.privateKey
+     * @param {string[]} options.x5cChain
+     * @param {object} [options.encryptionJwk]
+     * @param {string} [options.walletNonce]
+     * @param {string} [options.responseMode]
+     * @returns {Promise<string>} Signed JWT string
+     */
+    async createRequestObject({
+        clientId, nonce, state, responseUri, documentTypes, claims,
+        privateKey, x5cChain, encryptionJwk, walletNonce,
+        responseMode = ResponseMode.DIRECT_POST_JWT,
+    }) {
+        const credentials = documentTypes.map(docType => ({
+            id: createCredentialId(CredentialFormat.MSO_MDOC, docType),
+            format: CredentialFormat.MSO_MDOC,
+            meta: { doctype_value: docType },
+            claims: claims.map(c => ({ path: c })),
+        }));
+
+        const payload = {
+            client_id: clientId,
+            nonce,
+            state,
+            response_uri: responseUri,
+            response_type: 'vp_token',
+            response_mode: responseMode,
+            dcql_query: { credentials },
+        };
+
+        if (walletNonce !== undefined && walletNonce !== null) {
+            payload.wallet_nonce = walletNonce;
+        }
+
+        if (encryptionJwk) {
+            payload.client_metadata = {
+                encrypted_response_alg_values_supported: ['ECDH-ES'],
+                encrypted_response_enc_values_supported: ['A256GCM', 'A128GCM'],
+                jwks: {
+                    keys: [{ ...encryptionJwk, use: 'enc', kid: 'ephemeral-enc-key' }],
+                },
+            };
+        }
+
+        return signRequestObject(payload, privateKey, x5cChain);
+    }
+
+    /**
+     * Processes a direct_post or direct_post.jwt response from a wallet.
+     *
+     * @param {object} options
+     * @param {object} options.responseBody
+     * @param {object} [options.encryptionJwk]
+     * @returns {Promise<{ vpToken: any, state: string }>}
+     */
+    async processDirectPostResponse({ responseBody, encryptionJwk }) {
+        let vpToken;
+        let state;
+
+        if (responseBody.response && encryptionJwk) {
+            // direct_post.jwt — decrypt the JWE
+            const decrypted = await decryptJweResponse(responseBody.response, encryptionJwk);
+            vpToken = typeof decrypted.vp_token === 'string'
+                ? JSON.parse(decrypted.vp_token)
+                : decrypted.vp_token;
+            state = decrypted.state;
+        } else {
+            // plain direct_post
+            vpToken = typeof responseBody.vp_token === 'string'
+                ? JSON.parse(responseBody.vp_token)
+                : responseBody.vp_token;
+            state = responseBody.state;
+        }
+
+        return { vpToken, state };
     }
 }
 

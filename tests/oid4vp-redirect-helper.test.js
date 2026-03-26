@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as cbor2 from 'cbor2';
+import * as jose from 'jose';
 import oid4vpRedirectHelper from '../scripts/oid4vp-redirect-helper.js';
 import openid4vpProtocolHelper from '../scripts/openid-4vp-protocol-helper.js';
 
@@ -165,4 +166,178 @@ test('computeJwkThumbprint returns 32-byte Uint8Array and is deterministic', asy
     const okpResult = await oid4vpRedirectHelper.computeJwkThumbprint(okpJwk);
     assert.ok(okpResult instanceof Uint8Array, 'OKP result should be Uint8Array');
     assert.equal(okpResult.length, 32, 'OKP result should be 32 bytes');
+});
+
+// Helper for creating test signing material
+async function createTestSigningMaterial() {
+    const keyPair = await crypto.subtle.generateKey(
+        { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']
+    );
+    const { Certificate } = await import('pkijs');
+    const asn1js = await import('asn1js');
+    const cert = new Certificate();
+    cert.version = 2;
+    cert.serialNumber = new asn1js.Integer({ value: 1 });
+    await cert.subjectPublicKeyInfo.importKey(keyPair.publicKey);
+    cert.notBefore.value = new Date();
+    cert.notAfter.value = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
+    await cert.sign(keyPair.privateKey, 'SHA-256');
+    const certDer = new Uint8Array(cert.toSchema().toBER(false));
+    const base64Cert = Buffer.from(certDer).toString('base64');
+    const privateJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
+    const privateKey = await jose.importJWK(privateJwk, 'ES256');
+    return { privateKey, publicKey: keyPair.publicKey, x5cChain: [base64Cert], certDer };
+}
+
+// Test 9: createRequestObject creates a signed JWT with correct structure
+test('createRequestObject creates a signed JWT with correct structure', async () => {
+    const { privateKey, publicKey, x5cChain } = await createTestSigningMaterial();
+
+    const clientId = 'https://verifier.example.com';
+    const nonce = 'test-nonce-123';
+    const state = 'test-state-456';
+    const responseUri = 'https://verifier.example.com/response';
+    const documentTypes = ['org.iso.18013.5.1.mDL'];
+    const claims = ['given_name', 'family_name'];
+
+    const jwt = await oid4vpRedirectHelper.createRequestObject({
+        clientId,
+        nonce,
+        state,
+        responseUri,
+        documentTypes,
+        claims,
+        privateKey,
+        x5cChain,
+    });
+
+    assert.ok(typeof jwt === 'string', 'should return a string JWT');
+
+    // Verify the JWT using the public key
+    const publicKeyJwk = await crypto.subtle.exportKey('jwk', publicKey);
+    const josePublicKey = await jose.importJWK(publicKeyJwk, 'ES256');
+    const { payload, protectedHeader } = await jose.jwtVerify(jwt, josePublicKey, {
+        typ: 'oauth-authz-req+jwt',
+    });
+
+    // Check header
+    assert.equal(protectedHeader.typ, 'oauth-authz-req+jwt', 'header typ should be oauth-authz-req+jwt');
+    assert.ok(Array.isArray(protectedHeader.x5c), 'header should have x5c array');
+    assert.equal(protectedHeader.x5c.length, 1, 'x5c should have one cert');
+
+    // Check payload claims
+    assert.equal(payload.client_id, clientId, 'payload should have client_id');
+    assert.equal(payload.nonce, nonce, 'payload should have nonce');
+    assert.equal(payload.state, state, 'payload should have state');
+    assert.equal(payload.response_uri, responseUri, 'payload should have response_uri');
+    assert.equal(payload.response_type, 'vp_token', 'payload should have response_type=vp_token');
+    assert.equal(payload.response_mode, 'direct_post.jwt', 'payload should have response_mode=direct_post.jwt');
+
+    // Check dcql_query
+    assert.ok(payload.dcql_query, 'payload should have dcql_query');
+    assert.ok(Array.isArray(payload.dcql_query.credentials), 'dcql_query should have credentials array');
+    assert.equal(payload.dcql_query.credentials.length, 1, 'should have one credential query');
+
+    const cred = payload.dcql_query.credentials[0];
+    assert.equal(cred.id, 'cred-mso_mdoc-org_iso_18013_5_1_mDL', 'credential id should match');
+    assert.equal(cred.format, 'mso_mdoc', 'credential format should be mso_mdoc');
+    assert.equal(cred.meta.doctype_value, 'org.iso.18013.5.1.mDL', 'meta should have doctype_value');
+    assert.ok(Array.isArray(cred.claims), 'cred should have claims array');
+    assert.equal(cred.claims.length, 2, 'should have 2 claims');
+    assert.deepEqual(cred.claims[0], { path: 'given_name' }, 'first claim should be given_name');
+    assert.deepEqual(cred.claims[1], { path: 'family_name' }, 'second claim should be family_name');
+});
+
+// Test 10: createRequestObject includes client_metadata with encryption key when encryptionJwk provided
+test('createRequestObject includes client_metadata with encryption key when encryptionJwk provided', async () => {
+    const { privateKey, publicKey, x5cChain } = await createTestSigningMaterial();
+
+    // Generate an encryption key pair
+    const encKeyPair = await crypto.subtle.generateKey(
+        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey']
+    );
+    const encPublicJwk = await crypto.subtle.exportKey('jwk', encKeyPair.publicKey);
+    const encPrivateJwk = await crypto.subtle.exportKey('jwk', encKeyPair.privateKey);
+    const encryptionJwk = encPrivateJwk; // pass the private JWK as encryptionJwk
+
+    const jwt = await oid4vpRedirectHelper.createRequestObject({
+        clientId: 'https://verifier.example.com',
+        nonce: 'nonce-enc',
+        state: 'state-enc',
+        responseUri: 'https://verifier.example.com/response',
+        documentTypes: ['org.iso.18013.5.1.mDL'],
+        claims: ['age_over_18'],
+        privateKey,
+        x5cChain,
+        encryptionJwk,
+    });
+
+    const publicKeyJwk = await crypto.subtle.exportKey('jwk', publicKey);
+    const josePublicKey = await jose.importJWK(publicKeyJwk, 'ES256');
+    const { payload } = await jose.jwtVerify(jwt, josePublicKey, {
+        typ: 'oauth-authz-req+jwt',
+    });
+
+    assert.ok(payload.client_metadata, 'payload should have client_metadata');
+    assert.deepEqual(
+        payload.client_metadata.encrypted_response_alg_values_supported,
+        ['ECDH-ES'],
+        'should include ECDH-ES alg'
+    );
+    assert.deepEqual(
+        payload.client_metadata.encrypted_response_enc_values_supported,
+        ['A256GCM', 'A128GCM'],
+        'should include enc values'
+    );
+    assert.ok(payload.client_metadata.jwks, 'client_metadata should have jwks');
+    assert.ok(Array.isArray(payload.client_metadata.jwks.keys), 'jwks should have keys array');
+    assert.equal(payload.client_metadata.jwks.keys.length, 1, 'should have one key in jwks');
+    assert.equal(payload.client_metadata.jwks.keys[0].use, 'enc', 'key use should be enc');
+    assert.equal(payload.client_metadata.jwks.keys[0].kid, 'ephemeral-enc-key', 'key kid should be ephemeral-enc-key');
+});
+
+// Test 11: processDirectPostResponse decrypts JWE response and extracts vp_token and state
+test('processDirectPostResponse decrypts JWE response and extracts vp_token and state', async () => {
+    // Generate P-256 ECDH key pair for the verifier's encryption key
+    const encKeyPair = await crypto.subtle.generateKey(
+        { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']
+    );
+    const encPrivateJwk = await crypto.subtle.exportKey('jwk', encKeyPair.privateKey);
+    const encPublicJwk = await crypto.subtle.exportKey('jwk', encKeyPair.publicKey);
+
+    const vpTokenPayload = { 'cred-mso_mdoc-org_iso_18013_5_1_mDL': ['base64data'] };
+    const testState = 'test-state';
+    const plaintext = JSON.stringify({ vp_token: vpTokenPayload, state: testState });
+
+    // Encrypt using ECDH-ES + A256GCM using the verifier's public key
+    const recipientPublicKey = await jose.importJWK(encPublicJwk, 'ECDH-ES');
+    const jwe = await new jose.CompactEncrypt(new TextEncoder().encode(plaintext))
+        .setProtectedHeader({ alg: 'ECDH-ES', enc: 'A256GCM' })
+        .encrypt(recipientPublicKey);
+
+    const result = await oid4vpRedirectHelper.processDirectPostResponse({
+        responseBody: { response: jwe },
+        encryptionJwk: encPrivateJwk,
+    });
+
+    assert.ok(result, 'should return a result');
+    assert.deepEqual(result.vpToken, vpTokenPayload, 'vpToken should match the original payload');
+    assert.equal(result.state, testState, 'state should match');
+});
+
+// Test 12: processDirectPostResponse handles unencrypted direct_post
+test('processDirectPostResponse handles unencrypted direct_post', async () => {
+    const vpTokenPayload = { 'cred-mso_mdoc-org_iso_18013_5_1_mDL': ['base64data'] };
+    const responseBody = {
+        vp_token: JSON.stringify(vpTokenPayload),
+        state: 'plain-state',
+    };
+
+    const result = await oid4vpRedirectHelper.processDirectPostResponse({
+        responseBody,
+    });
+
+    assert.ok(result, 'should return a result');
+    assert.deepEqual(result.vpToken, vpTokenPayload, 'vpToken should be parsed from JSON string');
+    assert.equal(result.state, 'plain-state', 'state should match');
 });
