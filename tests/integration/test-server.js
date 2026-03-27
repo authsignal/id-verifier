@@ -412,8 +412,17 @@ async function handleResponseUri(req, res) {
                 // Decrypt the JWE directly — the wallet may send raw CBOR (ISO 18013-7)
                 // or JSON (OID4VP 1.0) inside the JWE
                 const privateKey = await jose.importJWK(s.encJwk, 'ECDH-ES');
-                const { plaintext } = await jose.compactDecrypt(responseBody.response, privateKey);
+                const { plaintext, protectedHeader: jweHeader } = await jose.compactDecrypt(responseBody.response, privateKey);
                 console.log('Decryption succeeded! Plaintext length:', plaintext.length);
+
+                // Extract mdocGeneratedNonce from JWE apu header (ISO 18013-7)
+                if (jweHeader.apu) {
+                    const apuBytes = typeof jweHeader.apu === 'string'
+                        ? Buffer.from(jweHeader.apu, 'base64url')
+                        : jweHeader.apu;
+                    s.mdocGeneratedNonce = new TextDecoder().decode(apuBytes);
+                    console.log('mdocGeneratedNonce (from apu):', s.mdocGeneratedNonce);
+                }
 
                 // Check if it's JSON or CBOR
                 let decoded;
@@ -482,6 +491,7 @@ async function handleResponseUri(req, res) {
             clientId: baseHost,
             nonce: session.nonce,
             responseUri: `${BASE_URL}/response`,
+            mdocGeneratedNonce: session.mdocGeneratedNonce,
         });
 
         console.log('\n--- Verification Result ---');

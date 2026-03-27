@@ -398,3 +398,60 @@ test('createDirectPostSuccessResponse omits redirect_uri for cross-device', () =
     const result = oid4vpRedirectHelper.createDirectPostSuccessResponse({});
     assert.equal(result.redirect_uri, undefined);
 });
+
+// ISO 18013-7 SessionTranscript tests
+test('_generateISO18013SessionTranscript produces [null, null, [clientIdHash, responseUriHash, nonce]]', async () => {
+    const clientId = 'verifier.example.com';
+    const responseUri = 'https://verifier.example.com/response';
+    const nonce = 'test-nonce-123';
+    const mdocGeneratedNonce = 'wallet-generated-nonce-abc';
+
+    const st = await oid4vpRedirectHelper._generateISO18013SessionTranscript(clientId, responseUri, nonce, mdocGeneratedNonce);
+    const decoded = cbor2.decode(st);
+
+    assert.equal(decoded.length, 3, 'SessionTranscript should be 3-element array');
+    assert.equal(decoded[0], null, 'DeviceEngagementBytes should be null');
+    assert.equal(decoded[1], null, 'EReaderKeyBytes should be null');
+
+    const handover = decoded[2];
+    assert.equal(handover.length, 3, 'OID4VPHandover should be 3-element array');
+    assert.ok(handover[0] instanceof Uint8Array, 'clientIdHash should be bytes');
+    assert.equal(handover[0].length, 32, 'clientIdHash should be 32 bytes (SHA-256)');
+    assert.ok(handover[1] instanceof Uint8Array, 'responseUriHash should be bytes');
+    assert.equal(handover[1].length, 32, 'responseUriHash should be 32 bytes (SHA-256)');
+    assert.equal(handover[2], nonce, 'nonce should be plain text');
+});
+
+test('_generateISO18013SessionTranscript is deterministic', async () => {
+    const args = ['verifier.example.com', 'https://verifier.example.com/response', 'nonce', 'mdocNonce'];
+    const st1 = await oid4vpRedirectHelper._generateISO18013SessionTranscript(...args);
+    const st2 = await oid4vpRedirectHelper._generateISO18013SessionTranscript(...args);
+    assert.deepEqual(st1, st2);
+});
+
+test('_generateISO18013SessionTranscript differs from OID4VP 1.0 handover', async () => {
+    const clientId = 'verifier.example.com';
+    const nonce = 'shared-nonce';
+    const responseUri = 'https://verifier.example.com/response';
+
+    const isoSt = await oid4vpRedirectHelper._generateISO18013SessionTranscript(clientId, responseUri, nonce, 'mdocNonce');
+    const oid4vpSt = await oid4vpRedirectHelper._generateSessionTranscript(clientId, nonce, null, responseUri);
+
+    assert.notDeepEqual(isoSt, oid4vpSt, 'ISO 18013-7 and OID4VP 1.0 transcripts must differ');
+});
+
+test('_generateISO18013SessionTranscript hashes include mdocGeneratedNonce', async () => {
+    const clientId = 'verifier.example.com';
+    const responseUri = 'https://verifier.example.com/response';
+    const nonce = 'nonce';
+
+    const st1 = await oid4vpRedirectHelper._generateISO18013SessionTranscript(clientId, responseUri, nonce, 'mdocNonce1');
+    const st2 = await oid4vpRedirectHelper._generateISO18013SessionTranscript(clientId, responseUri, nonce, 'mdocNonce2');
+
+    // Different mdocGeneratedNonce should produce different hashes
+    const h1 = cbor2.decode(st1)[2];
+    const h2 = cbor2.decode(st2)[2];
+    assert.notDeepEqual(h1[0], h2[0], 'clientIdHash should differ with different mdocGeneratedNonce');
+    assert.notDeepEqual(h1[1], h2[1], 'responseUriHash should differ with different mdocGeneratedNonce');
+    assert.equal(h1[2], h2[2], 'nonce should be the same');
+});

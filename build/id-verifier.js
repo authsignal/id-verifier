@@ -1123,11 +1123,13 @@ const mdocProtocolHelper = new MDOCProtocolHelper();
  * @param {string} alg - Signing algorithm (default: 'ES256')
  * @returns {Promise<string>} Signed JWT
  */
-async function signRequestObject(payload, privateKey, x5cChain, alg = 'ES256') {
-    return new SignJWT(payload)
-        .setProtectedHeader({ alg, typ: 'oauth-authz-req+jwt', x5c: x5cChain })
-        .setIssuedAt()
-        .sign(privateKey);
+async function signRequestObject(payload, privateKey, x5cChain, alg = 'ES256', { typ, kid, includeIat = true } = {}) {
+    const header = { alg, x5c: x5cChain };
+    if (typ) header.typ = typ;
+    if (kid) header.kid = kid;
+    const builder = new SignJWT(payload).setProtectedHeader(header);
+    if (includeIat) builder.setIssuedAt();
+    return builder.sign(privateKey);
 }
 
 /**
@@ -1144,12 +1146,14 @@ async function decryptJweResponse(jwe, recipientJwk) {
 
 class OID4VPRedirectHelper {
     /**
-     * Generates a SessionTranscript for OID4VP redirect-based flows.
-     * Per OID4VP 1.0 Appendix B.2.6.1.
+     * Generates a SessionTranscript for OID4VP 1.0 redirect flows (Appendix B.2.6.1).
+     * Used with DCQL-based wallets.
+     *
+     * SessionTranscript = [null, null, ["OpenID4VPHandover", SHA256(CBOR([clientId, nonce, jwkThumbprint, responseUri]))]]
      *
      * @param {string} clientId
      * @param {string} nonce
-     * @param {Uint8Array|null} jwkThumbprint - null if no encryption, otherwise 32-byte Uint8Array
+     * @param {Uint8Array|null} jwkThumbprint
      * @param {string} responseUri
      * @returns {Promise<Uint8Array>} CBOR-encoded SessionTranscript
      */
@@ -1158,37 +1162,68 @@ class OID4VPRedirectHelper {
         if (!nonce) throw new Error('nonce is required for generating session transcript');
         if (!responseUri) throw new Error('responseUri is required for generating session transcript');
 
-        // OpenID4VPHandoverInfo = [clientId, nonce, jwkThumbprint, responseUri]
         const handoverInfo = [clientId, nonce, jwkThumbprint, responseUri];
-
-        // Encode as CBOR
         const handoverInfoBytes = cbor2.encode(handoverInfo);
-
-        // SHA-256 hash
         const hashBuffer = await crypto.subtle.digest('SHA-256', handoverInfoBytes);
         const hashArray = new Uint8Array(hashBuffer);
 
-        // OpenID4VPHandover = ["OpenID4VPHandover", hash]
         const handover = ['OpenID4VPHandover', hashArray];
+        return cbor2.encode([null, null, handover]);
+    }
 
-        // SessionTranscript = [null, null, OpenID4VPHandover]
-        const sessionTranscript = cbor2.encode([null, null, handover]);
-        return sessionTranscript;
+    /**
+     * Generates a SessionTranscript for ISO 18013-7 Annex B / OID4VP 1.0 Appendix B.3.4.1.
+     * Used with Presentation Exchange-based wallets (MATTR, EUDI, etc.).
+     *
+     * SessionTranscript = [null, null, OID4VPHandover]
+     * OID4VPHandover = [clientIdHash, responseUriHash, nonce]
+     * clientIdHash    = SHA-256(CBOR([clientId, mdocGeneratedNonce]))
+     * responseUriHash = SHA-256(CBOR([responseUri, mdocGeneratedNonce]))
+     *
+     * @param {string} clientId - client_id from the Authorization Request
+     * @param {string} responseUri - response_uri from the Authorization Request
+     * @param {string} nonce - nonce from the Authorization Request
+     * @param {string} mdocGeneratedNonce - wallet-generated nonce from JWE apu header
+     * @returns {Promise<Uint8Array>} CBOR-encoded SessionTranscript
+     */
+    async _generateISO18013SessionTranscript(clientId, responseUri, nonce, mdocGeneratedNonce) {
+        if (!clientId) throw new Error('clientId is required');
+        if (!responseUri) throw new Error('responseUri is required');
+        if (!nonce) throw new Error('nonce is required');
+        if (!mdocGeneratedNonce) throw new Error('mdocGeneratedNonce is required');
+
+        // clientIdHash = SHA-256(CBOR([clientId, mdocGeneratedNonce]))
+        const clientIdToHash = cbor2.encode([clientId, mdocGeneratedNonce]);
+        const clientIdHash = new Uint8Array(await crypto.subtle.digest('SHA-256', clientIdToHash));
+
+        // responseUriHash = SHA-256(CBOR([responseUri, mdocGeneratedNonce]))
+        const responseUriToHash = cbor2.encode([responseUri, mdocGeneratedNonce]);
+        const responseUriHash = new Uint8Array(await crypto.subtle.digest('SHA-256', responseUriToHash));
+
+        // OID4VPHandover = [clientIdHash, responseUriHash, nonce]
+        const handover = [clientIdHash, responseUriHash, nonce];
+
+        return cbor2.encode([null, null, handover]);
     }
 
     /**
      * Creates an OID4VP authorization request URL for redirect-based flows.
      *
      * @param {object} options
-     * @param {string} options.clientId
+     * @param {string} options.clientId - The client identifier value
      * @param {string} options.requestUri
      * @param {string} [options.walletScheme] - defaults to 'openid4vp://'
      * @param {string} [options.requestUriMethod] - e.g. 'post'
+     * @param {string} [options.clientIdScheme] - If set, added as separate param (pre-1.0 / ISO 18013-7 format).
+     *   When provided, clientId should be the plain value (e.g. DNS name), not prefixed.
      * @returns {string}
      */
-    createAuthorizationRequestUrl({ clientId, requestUri, walletScheme = WalletScheme.OPENID4VP, requestUriMethod } = {}) {
+    createAuthorizationRequestUrl({ clientId, requestUri, walletScheme = WalletScheme.OPENID4VP, requestUriMethod, clientIdScheme } = {}) {
         const params = new URLSearchParams();
         params.set('client_id', clientId);
+        if (clientIdScheme) {
+            params.set('client_id_scheme', clientIdScheme);
+        }
         params.set('request_uri', requestUri);
         if (requestUriMethod !== undefined && requestUriMethod !== null) {
             params.set('request_uri_method', requestUriMethod);
@@ -1243,23 +1278,38 @@ class OID4VPRedirectHelper {
         clientId, nonce, state, responseUri, documentTypes, claims,
         privateKey, x5cChain, encryptionJwk, walletNonce,
         responseMode = ResponseMode.DIRECT_POST_JWT,
+        usePresentationExchange = false,
+        clientIdScheme,
+        typ = 'oauth-authz-req+jwt',
+        kid,
     }) {
-        const credentials = documentTypes.map(docType => ({
-            id: createCredentialId(CredentialFormat.MSO_MDOC, docType),
-            format: CredentialFormat.MSO_MDOC,
-            meta: { doctype_value: docType },
-            claims: claims.map(c => ({ path: c })),
-        }));
-
         const payload = {
+            aud: 'https://self-issued.me/v2',
             client_id: clientId,
             nonce,
             state,
             response_uri: responseUri,
             response_type: 'vp_token',
             response_mode: responseMode,
-            dcql_query: { credentials },
         };
+
+        if (clientIdScheme) {
+            payload.client_id_scheme = clientIdScheme;
+        }
+
+        if (usePresentationExchange) {
+            // ISO 18013-7 / OID4VP draft 18 format — Presentation Exchange
+            payload.presentation_definition = this._createPresentationDefinition(documentTypes, claims);
+        } else {
+            // OID4VP 1.0 format — DCQL
+            const credentials = documentTypes.map(docType => ({
+                id: createCredentialId(CredentialFormat.MSO_MDOC, docType),
+                format: CredentialFormat.MSO_MDOC,
+                meta: { doctype_value: docType },
+                claims: claims.map(c => ({ path: c })),
+            }));
+            payload.dcql_query = { credentials };
+        }
 
         if (walletNonce !== undefined && walletNonce !== null) {
             payload.wallet_nonce = walletNonce;
@@ -1269,15 +1319,21 @@ class OID4VPRedirectHelper {
             // Strip private key material — only embed public key in the JWT payload
             const { d, dp, dq, qi, ...publicJwk } = encryptionJwk;
             payload.client_metadata = {
-                encrypted_response_alg_values_supported: ['ECDH-ES'],
-                encrypted_response_enc_values_supported: ['A256GCM', 'A128GCM'],
+                authorization_encrypted_response_alg: 'ECDH-ES',
+                authorization_encrypted_response_enc: 'A256GCM',
+                vp_formats: {
+                    mso_mdoc: {
+                        alg: ['ES256', 'ES384', 'ES512'],
+                    },
+                },
+                require_signed_request_object: true,
                 jwks: {
-                    keys: [{ ...publicJwk, use: 'enc', kid: 'ephemeral-enc-key' }],
+                    keys: [{ ...publicJwk, use: 'enc', kid: 'ephemeral-enc-key', alg: 'ECDH-ES' }],
                 },
             };
         }
 
-        return signRequestObject(payload, privateKey, x5cChain);
+        return signRequestObject(payload, privateKey, x5cChain, 'ES256', { typ, kid, includeIat: !usePresentationExchange });
     }
 
     /**
@@ -1288,16 +1344,24 @@ class OID4VPRedirectHelper {
      * @param {string} options.clientId
      * @param {string} options.nonce
      * @param {string} options.responseUri
-     * @param {object} [options.encryptionJwk] - Public JWK used for encryption (to compute thumbprint)
+     * @param {object} [options.encryptionJwk] - Public JWK used for encryption (to compute thumbprint for OID4VP 1.0)
+     * @param {string} [options.mdocGeneratedNonce] - Wallet-generated nonce from JWE apu header (for ISO 18013-7)
      * @param {string[]} [options.trustLists] - Trust list identifiers; defaults to ALL_TRUST_LISTS
      * @returns {Promise<{ claims, valid, trusted, processedDocuments, sessionTranscript }>}
      */
-    async verify({ vpToken, clientId, nonce, responseUri, encryptionJwk, trustLists = ALL_TRUST_LISTS }) {
-        const jwkThumbprint = encryptionJwk
-            ? await this.computeJwkThumbprint(encryptionJwk)
-            : null;
+    async verify({ vpToken, clientId, nonce, responseUri, encryptionJwk, mdocGeneratedNonce, trustLists = ALL_TRUST_LISTS }) {
+        let sessionTranscript;
 
-        const sessionTranscript = await this._generateSessionTranscript(clientId, nonce, jwkThumbprint, responseUri);
+        if (mdocGeneratedNonce) {
+            // ISO 18013-7 Annex B / OID4VP 1.0 Appendix B.3.4.1
+            sessionTranscript = await this._generateISO18013SessionTranscript(clientId, responseUri, nonce, mdocGeneratedNonce);
+        } else {
+            // OID4VP 1.0 Appendix B.2.6.1 (DC API-adjacent redirect flow)
+            const jwkThumbprint = encryptionJwk
+                ? await this.computeJwkThumbprint(encryptionJwk)
+                : null;
+            sessionTranscript = await this._generateSessionTranscript(clientId, nonce, jwkThumbprint, responseUri);
+        }
 
         const allClaims = {};
         let valid = true;
@@ -1401,6 +1465,41 @@ class OID4VPRedirectHelper {
         }
 
         return { vpToken, state };
+    }
+
+    /**
+     * Build a Presentation Exchange presentation_definition for ISO 18013-7 / OID4VP draft 18.
+     * This is the legacy format that older wallets (MATTR, etc.) expect.
+     *
+     * @param {string[]} documentTypes
+     * @param {Array<[string, string]>} claims - [namespace, element] pairs
+     * @returns {Object} presentation_definition
+     */
+    _createPresentationDefinition(documentTypes, claims) {
+        const inputDescriptors = documentTypes.map((docType, idx) => {
+            const fields = claims.map(([namespace, element]) => ({
+                path: [`$['${namespace}']['${element}']`],
+                intent_to_retain: false,
+            }));
+
+            return {
+                id: `${docType}`,
+                format: {
+                    mso_mdoc: {
+                        alg: ['ES256'],
+                    },
+                },
+                constraints: {
+                    limit_disclosure: 'required',
+                    fields,
+                },
+            };
+        });
+
+        return {
+            id: crypto.randomUUID(),
+            input_descriptors: inputDescriptors,
+        };
     }
 }
 

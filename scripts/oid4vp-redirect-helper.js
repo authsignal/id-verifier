@@ -5,12 +5,14 @@ import { decodeVpToken, verifyDocument } from './formats/mdoc-helper.js';
 
 class OID4VPRedirectHelper {
     /**
-     * Generates a SessionTranscript for OID4VP redirect-based flows.
-     * Per OID4VP 1.0 Appendix B.2.6.1.
+     * Generates a SessionTranscript for OID4VP 1.0 redirect flows (Appendix B.2.6.1).
+     * Used with DCQL-based wallets.
+     *
+     * SessionTranscript = [null, null, ["OpenID4VPHandover", SHA256(CBOR([clientId, nonce, jwkThumbprint, responseUri]))]]
      *
      * @param {string} clientId
      * @param {string} nonce
-     * @param {Uint8Array|null} jwkThumbprint - null if no encryption, otherwise 32-byte Uint8Array
+     * @param {Uint8Array|null} jwkThumbprint
      * @param {string} responseUri
      * @returns {Promise<Uint8Array>} CBOR-encoded SessionTranscript
      */
@@ -19,22 +21,48 @@ class OID4VPRedirectHelper {
         if (!nonce) throw new Error('nonce is required for generating session transcript');
         if (!responseUri) throw new Error('responseUri is required for generating session transcript');
 
-        // OpenID4VPHandoverInfo = [clientId, nonce, jwkThumbprint, responseUri]
         const handoverInfo = [clientId, nonce, jwkThumbprint, responseUri];
-
-        // Encode as CBOR
         const handoverInfoBytes = cbor2.encode(handoverInfo);
-
-        // SHA-256 hash
         const hashBuffer = await crypto.subtle.digest('SHA-256', handoverInfoBytes);
         const hashArray = new Uint8Array(hashBuffer);
 
-        // OpenID4VPHandover = ["OpenID4VPHandover", hash]
         const handover = ['OpenID4VPHandover', hashArray];
+        return cbor2.encode([null, null, handover]);
+    }
 
-        // SessionTranscript = [null, null, OpenID4VPHandover]
-        const sessionTranscript = cbor2.encode([null, null, handover]);
-        return sessionTranscript;
+    /**
+     * Generates a SessionTranscript for ISO 18013-7 Annex B / OID4VP 1.0 Appendix B.3.4.1.
+     * Used with Presentation Exchange-based wallets (MATTR, EUDI, etc.).
+     *
+     * SessionTranscript = [null, null, OID4VPHandover]
+     * OID4VPHandover = [clientIdHash, responseUriHash, nonce]
+     * clientIdHash    = SHA-256(CBOR([clientId, mdocGeneratedNonce]))
+     * responseUriHash = SHA-256(CBOR([responseUri, mdocGeneratedNonce]))
+     *
+     * @param {string} clientId - client_id from the Authorization Request
+     * @param {string} responseUri - response_uri from the Authorization Request
+     * @param {string} nonce - nonce from the Authorization Request
+     * @param {string} mdocGeneratedNonce - wallet-generated nonce from JWE apu header
+     * @returns {Promise<Uint8Array>} CBOR-encoded SessionTranscript
+     */
+    async _generateISO18013SessionTranscript(clientId, responseUri, nonce, mdocGeneratedNonce) {
+        if (!clientId) throw new Error('clientId is required');
+        if (!responseUri) throw new Error('responseUri is required');
+        if (!nonce) throw new Error('nonce is required');
+        if (!mdocGeneratedNonce) throw new Error('mdocGeneratedNonce is required');
+
+        // clientIdHash = SHA-256(CBOR([clientId, mdocGeneratedNonce]))
+        const clientIdToHash = cbor2.encode([clientId, mdocGeneratedNonce]);
+        const clientIdHash = new Uint8Array(await crypto.subtle.digest('SHA-256', clientIdToHash));
+
+        // responseUriHash = SHA-256(CBOR([responseUri, mdocGeneratedNonce]))
+        const responseUriToHash = cbor2.encode([responseUri, mdocGeneratedNonce]);
+        const responseUriHash = new Uint8Array(await crypto.subtle.digest('SHA-256', responseUriToHash));
+
+        // OID4VPHandover = [clientIdHash, responseUriHash, nonce]
+        const handover = [clientIdHash, responseUriHash, nonce];
+
+        return cbor2.encode([null, null, handover]);
     }
 
     /**
@@ -175,16 +203,24 @@ class OID4VPRedirectHelper {
      * @param {string} options.clientId
      * @param {string} options.nonce
      * @param {string} options.responseUri
-     * @param {object} [options.encryptionJwk] - Public JWK used for encryption (to compute thumbprint)
+     * @param {object} [options.encryptionJwk] - Public JWK used for encryption (to compute thumbprint for OID4VP 1.0)
+     * @param {string} [options.mdocGeneratedNonce] - Wallet-generated nonce from JWE apu header (for ISO 18013-7)
      * @param {string[]} [options.trustLists] - Trust list identifiers; defaults to ALL_TRUST_LISTS
      * @returns {Promise<{ claims, valid, trusted, processedDocuments, sessionTranscript }>}
      */
-    async verify({ vpToken, clientId, nonce, responseUri, encryptionJwk, trustLists = ALL_TRUST_LISTS }) {
-        const jwkThumbprint = encryptionJwk
-            ? await this.computeJwkThumbprint(encryptionJwk)
-            : null;
+    async verify({ vpToken, clientId, nonce, responseUri, encryptionJwk, mdocGeneratedNonce, trustLists = ALL_TRUST_LISTS }) {
+        let sessionTranscript;
 
-        const sessionTranscript = await this._generateSessionTranscript(clientId, nonce, jwkThumbprint, responseUri);
+        if (mdocGeneratedNonce) {
+            // ISO 18013-7 Annex B / OID4VP 1.0 Appendix B.3.4.1
+            sessionTranscript = await this._generateISO18013SessionTranscript(clientId, responseUri, nonce, mdocGeneratedNonce);
+        } else {
+            // OID4VP 1.0 Appendix B.2.6.1 (DC API-adjacent redirect flow)
+            const jwkThumbprint = encryptionJwk
+                ? await this.computeJwkThumbprint(encryptionJwk)
+                : null;
+            sessionTranscript = await this._generateSessionTranscript(clientId, nonce, jwkThumbprint, responseUri);
+        }
 
         const allClaims = {};
         let valid = true;
