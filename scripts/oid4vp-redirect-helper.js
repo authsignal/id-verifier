@@ -211,18 +211,18 @@ class OID4VPRedirectHelper {
     async verify({ vpToken, clientId, nonce, responseUri, encryptionJwk, mdocGeneratedNonce,
                    trustLists = ALL_TRUST_LISTS, trustedCertificates,
                    enableCrl = false, crlCacheTtlMs, enableStatusList = false, statusListCacheTtlMs }) {
-        let sessionTranscript;
+        // Build candidate SessionTranscripts — try OID4VP 1.0 first, then ISO 18013-7 fallback
+        const jwkThumbprint = encryptionJwk
+            ? await this.computeJwkThumbprint(encryptionJwk)
+            : null;
 
+        const sessionTranscripts = [];
         if (mdocGeneratedNonce) {
-            // ISO 18013-7 Annex B / OID4VP 1.0 Appendix B.3.4.1
-            sessionTranscript = await this._generateISO18013SessionTranscript(clientId, responseUri, nonce, mdocGeneratedNonce);
-        } else {
-            // OID4VP 1.0 Appendix B.2.6.1 (DC API-adjacent redirect flow)
-            const jwkThumbprint = encryptionJwk
-                ? await this.computeJwkThumbprint(encryptionJwk)
-                : null;
-            sessionTranscript = await this._generateSessionTranscript(clientId, nonce, jwkThumbprint, responseUri);
+            // Try first: ISO 18013-7 Annex B / OID4VP 1.0 Appendix B.3.4.1
+            sessionTranscripts.push(await this._generateISO18013SessionTranscript(clientId, responseUri, nonce, mdocGeneratedNonce));
         }
+        // Then try: OID4VP 1.0 Appendix B.2.6.1
+        sessionTranscripts.push(await this._generateSessionTranscript(clientId, nonce, jwkThumbprint, responseUri));
 
         const allClaims = {};
         let valid = true;
@@ -230,6 +230,7 @@ class OID4VPRedirectHelper {
         let issuerTrusted = true;
         let issuerRevoked = false;
         let credentialRevoked = false;
+        let matchedSessionTranscript = sessionTranscripts[0]; // default to first
         const processedDocuments = [];
 
         for (const credentialKey of Object.keys(vpToken)) {
@@ -242,9 +243,17 @@ class OID4VPRedirectHelper {
             for (const token of tokens) {
                 const decoded = await decodeVpToken(token);
                 for (const doc of decoded.documents) {
-                    const docResult = await verifyDocument(
-                        doc, sessionTranscript, { trustedCertificates, enableCrl, crlCacheTtlMs, enableStatusList, statusListCacheTtlMs }
-                    );
+                    // Try each SessionTranscript candidate — use the first one where credentialVerified passes
+                    let docResult;
+                    for (const st of sessionTranscripts) {
+                        docResult = await verifyDocument(
+                            doc, st, { trustedCertificates, enableCrl, crlCacheTtlMs, enableStatusList, statusListCacheTtlMs }
+                        );
+                        if (docResult.credentialVerified) {
+                            matchedSessionTranscript = st;
+                            break;
+                        }
+                    }
 
                     Object.assign(allClaims, docResult.claims);
 
@@ -277,7 +286,7 @@ class OID4VPRedirectHelper {
             issuerRevoked,
             credentialRevoked,
             processedDocuments,
-            sessionTranscript,
+            sessionTranscript: matchedSessionTranscript,
         };
     }
 

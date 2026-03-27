@@ -109,24 +109,47 @@ async function generateSelfSignedCert() {
 }
 
 async function generateReaderKeyAndCert() {
-    // Generate reader cert with dNSName SAN matching the BASE_URL hostname
-    // This is required for x509_san_dns — the wallet checks the SAN
+    // Generate a proper 2-cert chain: CA cert → reader leaf cert
+    // This is required for wallets that verify the x5c chain (Multipaz, etc.)
     const baseHost = new URL(BASE_URL).hostname;
+
+    const caKeyPath = path.join(CERT_DIR, 'ca-key.pem');
+    const caCertPath = path.join(CERT_DIR, 'ca-cert.pem');
     const readerKeyPath = path.join(CERT_DIR, 'reader-key.pem');
+    const readerCsrPath = path.join(CERT_DIR, 'reader.csr');
     const readerCertPath = path.join(CERT_DIR, 'reader-cert.pem');
+    const extFilePath = path.join(CERT_DIR, 'reader-ext.cnf');
 
     if (!fs.existsSync(CERT_DIR)) fs.mkdirSync(CERT_DIR, { recursive: true });
 
+    // Step 1: Generate CA key + self-signed CA cert
     execSync(
         `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -pkeyopt ec_param_enc:named_curve ` +
-        `-keyout "${readerKeyPath}" -out "${readerCertPath}" -days 30 -nodes ` +
-        `-subj "/CN=${baseHost}" ` +
-        `-addext "subjectAltName=DNS:${baseHost}" 2>/dev/null`
+        `-keyout "${caKeyPath}" -out "${caCertPath}" -days 30 -nodes ` +
+        `-subj "/CN=OID4VP Test CA/O=id-verifier" ` +
+        `-addext "basicConstraints=critical,CA:TRUE" ` +
+        `-addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null`
+    );
+
+    // Step 2: Generate reader key + CSR
+    execSync(
+        `openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -pkeyopt ec_param_enc:named_curve ` +
+        `-keyout "${readerKeyPath}" -out "${readerCsrPath}" -nodes ` +
+        `-subj "/CN=${baseHost}" 2>/dev/null`
+    );
+
+    // Step 3: Sign reader cert with CA, adding SAN extension
+    fs.writeFileSync(extFilePath, `subjectAltName=DNS:${baseHost}\n`);
+    execSync(
+        `openssl x509 -req -in "${readerCsrPath}" -CA "${caCertPath}" -CAkey "${caKeyPath}" ` +
+        `-CAcreateserial -out "${readerCertPath}" -days 30 ` +
+        `-extfile "${extFilePath}" 2>/dev/null`
     );
 
     // Read the PEM files
     const keyPem = fs.readFileSync(readerKeyPath, 'utf-8');
-    const certPem = fs.readFileSync(readerCertPath, 'utf-8');
+    const readerCertPem = fs.readFileSync(readerCertPath, 'utf-8');
+    const caCertPem = fs.readFileSync(caCertPath, 'utf-8');
 
     // Import private key as Web Crypto (extractable) then convert for jose
     const privateKeyObj = await crypto.subtle.importKey(
@@ -146,19 +169,71 @@ async function generateReaderKeyAndCert() {
     publicKeyJwk.alg = 'ES256';
     publicKeyJwk.use = 'sig';
 
-    // Get DER bytes of cert for x5c chain and x509_hash
-    const certBase64 = certPem
+    // Build x5c chains
+    const readerCertBase64 = readerCertPem
         .replace(/-----BEGIN CERTIFICATE-----/, '')
         .replace(/-----END CERTIFICATE-----/, '')
         .replace(/\s/g, '');
-    const certDer = Buffer.from(certBase64, 'base64');
-    const x5cChain = [certBase64]; // x5c is base64-encoded DER
-    const hash = await generateX509Hash(new Uint8Array(certDer));
+    const caCertBase64 = caCertPem
+        .replace(/-----BEGIN CERTIFICATE-----/, '')
+        .replace(/-----END CERTIFICATE-----/, '')
+        .replace(/\s/g, '');
+    const readerCertDer = Buffer.from(readerCertBase64, 'base64');
+
+    // Two-cert chain for OID4VP 1.0 wallets that verify the chain (Multipaz)
+    const x5cChainFull = [readerCertBase64, caCertBase64];
+
+    // Also generate a single self-signed cert for ISO 18013-7 wallets (MATTR)
+    // that were working with single certs before
+    const singleCertKeyPath = path.join(CERT_DIR, 'single-key.pem');
+    const singleCertPath = path.join(CERT_DIR, 'single-cert.pem');
+    execSync(
+        `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -pkeyopt ec_param_enc:named_curve ` +
+        `-keyout "${singleCertKeyPath}" -out "${singleCertPath}" -days 30 -nodes ` +
+        `-subj "/CN=${baseHost}" ` +
+        `-addext "subjectAltName=DNS:${baseHost}" 2>/dev/null`
+    );
+    const singleCertPem = fs.readFileSync(singleCertPath, 'utf-8');
+    const singleKeyPem = fs.readFileSync(singleCertKeyPath, 'utf-8');
+    const singleCertBase64 = singleCertPem
+        .replace(/-----BEGIN CERTIFICATE-----/, '')
+        .replace(/-----END CERTIFICATE-----/, '')
+        .replace(/\s/g, '');
+    const singleCertDer = Buffer.from(singleCertBase64, 'base64');
+    const singlePrivateKeyObj = await crypto.subtle.importKey(
+        'pkcs8',
+        Buffer.from(singleKeyPem.replace(/-----BEGIN PRIVATE KEY-----/, '').replace(/-----END PRIVATE KEY-----/, '').replace(/\s/g, ''), 'base64'),
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['sign']
+    );
+    const singlePrivateJwk = await crypto.subtle.exportKey('jwk', singlePrivateKeyObj);
+    const singleSigningKey = await jose.importJWK(singlePrivateJwk, 'ES256');
+    const singleKid = crypto.randomUUID();
+    const { d: _d2, ...singlePublicKeyJwk } = singlePrivateJwk;
+    singlePublicKeyJwk.kid = singleKid;
+    singlePublicKeyJwk.alg = 'ES256';
+    singlePublicKeyJwk.use = 'sig';
+    const singleHash = await generateX509Hash(new Uint8Array(singleCertDer));
+
+    const hash = await generateX509Hash(new Uint8Array(readerCertDer));
     const clientId = `x509_hash:${hash}`;
 
     console.log('Reader cert SAN:', `DNS:${baseHost}`);
+    console.log('x5c chain: leaf + CA (2 certs) for OID4VP 1.0');
+    console.log('x5c single: self-signed for ISO 18013-7');
 
-    return { clientId, signingKey, x5cChain, publicKeyJwk, kid };
+    return {
+        clientId, signingKey, x5cChain: x5cChainFull, publicKeyJwk, kid,
+        // ISO 18013-7 mode uses single self-signed cert (MATTR compatible)
+        iso: {
+            clientId: `x509_hash:${singleHash}`,
+            signingKey: singleSigningKey,
+            x5cChain: [singleCertBase64],
+            publicKeyJwk: singlePublicKeyJwk,
+            kid: singleKid,
+        },
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +490,8 @@ async function handleRequestUri(req, res, sessionId) {
             kid: readerAuth.kid,
         });
     } else {
-        // ISO 18013-7 — x509_san_dns, PEX, no typ
+        // ISO 18013-7 — x509_san_dns, PEX, no typ, single self-signed cert
+        const iso = readerAuth.iso;
         jwt = await createRequestObject({
             clientId: baseHost,
             clientIdScheme: 'x509_san_dns',
@@ -424,14 +500,14 @@ async function handleRequestUri(req, res, sessionId) {
             responseUri: `${BASE_URL}/response`,
             documentTypes: [DOC_TYPE],
             claims,
-            privateKey: readerAuth.signingKey,
-            x5cChain: readerAuth.x5cChain,
+            privateKey: iso.signingKey,
+            x5cChain: iso.x5cChain,
             walletNonce,
             responseMode: 'direct_post.jwt',
             usePresentationExchange: true,
             encryptionJwk: encPublicJwk,
             typ: null,
-            kid: readerAuth.kid,
+            kid: iso.kid,
         });
     }
 
@@ -560,12 +636,16 @@ async function handleResponseUri(req, res) {
             ? `x509_hash:${readerAuth.clientId.split(':')[1]}`
             : baseHost;
 
+        // Get public part of encryption JWK for thumbprint computation
+        const { d: _d, dp: _dp, dq: _dq, qi: _qi, ...encPublicJwk } = session.encJwk;
+
         const result = await verifyRedirectResponse({
             vpToken: vpTokenObj,
             clientId: verifyClientId,
             nonce: session.nonce,
             responseUri: `${BASE_URL}/response`,
             mdocGeneratedNonce: session.mdocGeneratedNonce,
+            encryptionJwk: encPublicJwk,
             trustedCertificates: iacaPem ? [iacaPem] : undefined,
             enableCrl: true,
             enableStatusList: true,
@@ -792,7 +872,7 @@ function route(req, res) {
     if (pathname === '/.well-known/oauth-client' || pathname === '/.well-known/openid-credential-verifier') {
         const metadata = {
             jwks: {
-                keys: [readerAuth.publicKeyJwk],
+                keys: [readerAuth.publicKeyJwk, readerAuth.iso.publicKeyJwk],
             },
             authorization_encrypted_response_enc: 'A256GCM',
             authorization_encrypted_response_alg: 'ECDH-ES',
