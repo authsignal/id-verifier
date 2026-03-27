@@ -226,7 +226,10 @@ class OID4VPRedirectHelper {
 
         const allClaims = {};
         let valid = true;
-        let trusted = true;
+        let credentialVerified = true;
+        let issuerTrusted = true;
+        let issuerRevoked = false;
+        let credentialRevoked = false;
         const processedDocuments = [];
 
         for (const credentialKey of Object.keys(vpToken)) {
@@ -239,29 +242,43 @@ class OID4VPRedirectHelper {
             for (const token of tokens) {
                 const decoded = await decodeVpToken(token);
                 for (const doc of decoded.documents) {
-                    const { claims, issuer, valid: docValid, invalidReasons, statusListRef } = await verifyDocument(
+                    const docResult = await verifyDocument(
                         doc, sessionTranscript, { trustedCertificates, enableCrl, crlCacheTtlMs, enableStatusList, statusListCacheTtlMs }
                     );
 
-                    Object.assign(allClaims, claims);
+                    Object.assign(allClaims, docResult.claims);
 
-                    if (!docValid) valid = false;
+                    if (!docResult.credentialVerified) credentialVerified = false;
+                    if (!docResult.issuerTrusted) issuerTrusted = false;
+                    if (docResult.issuerRevoked) issuerRevoked = true;
+                    if (docResult.credentialRevoked) credentialRevoked = true;
+                    if (!docResult.valid) valid = false;
 
-                    const issuerTrusted = trustedCertificates
-                        ? (issuer?.trusted === true)
-                        : (issuer && (
-                            trustLists === ALL_TRUST_LISTS ||
-                            (Array.isArray(trustLists) && trustLists.includes('all_trust_lists')) ||
-                            issuer.certificate?.trust_lists?.some(tl => trustLists.includes(tl))
-                        ));
-                    if (!issuerTrusted) trusted = false;
-
-                    processedDocuments.push({ claims, issuer, valid: docValid, trusted: !!issuerTrusted, invalidReasons, statusListRef });
+                    processedDocuments.push({
+                        claims: docResult.claims,
+                        issuer: docResult.issuer,
+                        valid: docResult.valid,
+                        credentialVerified: docResult.credentialVerified,
+                        issuerTrusted: docResult.issuerTrusted,
+                        issuerRevoked: docResult.issuerRevoked,
+                        credentialRevoked: docResult.credentialRevoked,
+                        invalidReasons: docResult.invalidReasons,
+                        statusListRef: docResult.statusListRef,
+                    });
                 }
             }
         }
 
-        return { claims: allClaims, valid, trusted, processedDocuments, sessionTranscript };
+        return {
+            claims: allClaims,
+            valid,
+            credentialVerified,
+            issuerTrusted,
+            issuerRevoked,
+            credentialRevoked,
+            processedDocuments,
+            sessionTranscript,
+        };
     }
 
     /**

@@ -1,65 +1,117 @@
 import pako from 'pako';
+import * as cbor2 from 'cbor2';
 import { FetchCache } from './fetch-cache.js';
 
-// Cache for status list JWTs, keyed by URI
+// CWT payload keys per Token Status List spec
+const CWT_STATUS_LIST_KEY = -65538; // status_list
+const CWT_STATUS_LIST_BITS = 'bits';
+const CWT_STATUS_LIST_LST = 'lst';
+
+// Cache for status list tokens (JWT or CWT), keyed by URI
 const statusListCache = new FetchCache({
     fetchFn: async (url) => {
-        const response = await fetch(url, {
-            headers: { Accept: 'application/statuslist+jwt' },
-        });
+        // Don't send restrictive Accept header — let the server decide format
+        const response = await fetch(url);
         if (!response.ok) {
             throw new Error(`Failed to fetch status list from ${url}: ${response.status}`);
         }
-        return response.text();
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('cwt') || contentType.includes('cbor') || contentType.includes('octet-stream')) {
+            // CWT format — return raw bytes + format indicator
+            const arrayBuffer = await response.arrayBuffer();
+            return { format: 'cwt', data: new Uint8Array(arrayBuffer) };
+        }
+        // JWT format — return text + format indicator
+        const text = await response.text();
+        // Check if it looks like a JWT (three dot-separated parts)
+        if (text.includes('.')) {
+            return { format: 'jwt', data: text };
+        }
+        // Might be binary CWT returned without proper content-type
+        return { format: 'cwt', data: new Uint8Array(await new Blob([text]).arrayBuffer()) };
     },
 });
 
 /**
- * Decodes a base64url-encoded, zlib-compressed bitstring and extracts the
- * status value at the given index, using RFC 9597 MSB-first bit ordering.
- *
- * @param {string} compressedBitstring - base64url-encoded zlib-compressed bitstring
- * @param {number} index - credential's position in the status list
- * @param {number} bits - bits per entry (1 or 2, default 1)
- * @returns {number} numeric status value (0 = valid, non-zero = revoked/suspended)
+ * Extract the status list (compressed bitstring + bits) from a JWT or CWT token.
+ * @param {{ format: string, data: any }} token - The fetched token
+ * @returns {{ lst: Uint8Array|string, bits: number }} The status list data
  */
-export function getStatusFromBitstring(compressedBitstring, index, bits = 1) {
-    const compressed = Buffer.from(compressedBitstring, 'base64url');
-    const bitstring = pako.inflate(compressed);
-
-    // RFC 9597: index 0 is the MSB of byte 0 (bit 7), index 1 is bit 6, etc.
-    const bitOffset = index * bits;
-    const byteIndex = Math.floor(bitOffset / 8);
-    const bitPositionFromMSB = bitOffset % 8;
-    // Bit position from LSB within the byte for the MSB of our value
-    const msbBitFromLSB = 7 - bitPositionFromMSB;
-
-    let value = 0;
-    for (let i = 0; i < bits; i++) {
-        const currentBitFromLSB = msbBitFromLSB - i;
-        if (currentBitFromLSB < 0) {
-            // Span across byte boundary
-            const nextByteIndex = byteIndex + 1;
-            const nextBitFromLSB = 7 - (bitPositionFromMSB + i - 8);
-            const bit = (bitstring[nextByteIndex] >> nextBitFromLSB) & 1;
-            value = (value << 1) | bit;
-        } else {
-            const bit = (bitstring[byteIndex] >> currentBitFromLSB) & 1;
-            value = (value << 1) | bit;
-        }
+function extractStatusList(token) {
+    if (token.format === 'jwt') {
+        // JWT: decode payload (base64url), extract status_list.lst and status_list.bits
+        const parts = token.data.split('.');
+        if (parts.length < 2) throw new Error('Invalid JWT format');
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+        const statusList = payload?.status_list;
+        if (!statusList?.lst) throw new Error('JWT missing status_list.lst');
+        return { lst: statusList.lst, bits: statusList.bits || 1, isBase64url: true };
     }
 
-    return value;
+    if (token.format === 'cwt') {
+        // CWT: COSE_Sign1 = Tag(18, [protectedHeaders, unprotectedHeaders, payload, signature])
+        const decoded = cbor2.decode(token.data);
+        const coseArray = decoded.contents || decoded;
+        const payloadRaw = coseArray[2]; // third element is the payload
+        const payload = cbor2.decode(payloadRaw);
+
+        // Payload is a CBOR Map with key -65538 for status_list
+        let statusList;
+        if (payload instanceof Map) {
+            statusList = payload.get(CWT_STATUS_LIST_KEY);
+        } else {
+            statusList = payload[CWT_STATUS_LIST_KEY] || payload.status_list;
+        }
+
+        if (!statusList) throw new Error('CWT missing status_list');
+
+        const lst = statusList instanceof Map ? statusList.get(CWT_STATUS_LIST_LST) : statusList[CWT_STATUS_LIST_LST] || statusList.lst;
+        const bits = statusList instanceof Map ? statusList.get(CWT_STATUS_LIST_BITS) : statusList[CWT_STATUS_LIST_BITS] || statusList.bits || 1;
+
+        if (!lst) throw new Error('CWT status_list missing lst');
+        return { lst, bits, isBase64url: false };
+    }
+
+    throw new Error(`Unknown token format: ${token.format}`);
+}
+
+/**
+ * Decodes a zlib-compressed bitstring and extracts the status value at the given index.
+ * RFC 9597 MSB-first bit ordering: index 0 is bit 7 of byte 0.
+ *
+ * @param {string|Uint8Array} compressedBitstring - base64url string or raw bytes
+ * @param {number} index - credential's position in the status list
+ * @param {number} bits - bits per entry (1 or 2, default 1)
+ * @param {boolean} [isBase64url=true] - whether the input is base64url-encoded
+ * @returns {number} numeric status value (0 = valid, non-zero = revoked/suspended)
+ */
+export function getStatusFromBitstring(compressedBitstring, index, bits = 1, isBase64url = true) {
+    let compressed;
+    if (isBase64url && typeof compressedBitstring === 'string') {
+        compressed = Buffer.from(compressedBitstring, 'base64url');
+    } else if (compressedBitstring instanceof Uint8Array) {
+        compressed = compressedBitstring;
+    } else {
+        compressed = Buffer.from(compressedBitstring, 'base64url');
+    }
+    const bitstring = pako.inflate(compressed);
+
+    // RFC 9597 Section 4.1: bit position starts from the LEAST significant bit
+    const byteIndex = Math.floor((index * bits) / 8);
+    const bitPosition = (index * bits) % 8; // from LSB
+    const mask = ((1 << bits) - 1) << bitPosition;
+    return (bitstring[byteIndex] & mask) >> bitPosition;
 }
 
 /**
  * Checks the revocation status of a credential using an IETF Token Status List.
+ * Supports both JWT and CWT (CBOR Web Token) formats.
  *
- * @param {{ uri: string, index: number }} statusListRef - status list reference
- * @param {object} options
- * @param {boolean} [options.enabled=true] - if false, skip check and return not revoked
- * @param {number} [options.cacheTtlMs=300000] - cache TTL in ms (default 5 min)
- * @param {number} [options.bits=1] - bits per entry
+ * @param {{ uri: string, index: number }} statusListRef
+ * @param {object} [options]
+ * @param {boolean} [options.enabled=true]
+ * @param {number} [options.cacheTtlMs=300000]
+ * @param {number} [options.bits=1]
  * @returns {Promise<{ revoked: boolean, status?: number, statusListRef: object }>}
  */
 export async function checkTokenStatusList(statusListRef, options = {}) {
@@ -69,26 +121,16 @@ export async function checkTokenStatusList(statusListRef, options = {}) {
         return { revoked: false, statusListRef };
     }
 
-    const jwt = await statusListCache.get(statusListRef.uri, { ttlMs: cacheTtlMs });
-    if (!jwt) {
-        throw new Error(`Failed to fetch status list from ${statusListRef.uri}`);
+    const token = await statusListCache.get(statusListRef.uri, { ttlMs: cacheTtlMs });
+    if (!token) {
+        console.error(`Failed to fetch status list from ${statusListRef.uri}`);
+        return { revoked: false, statusListRef };
     }
 
-    // Decode JWT payload (base64url, no signature verification — issuer already trusted)
-    const parts = jwt.split('.');
-    if (parts.length < 2) {
-        throw new Error(`Invalid JWT format from ${statusListRef.uri}`);
-    }
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    const { lst, bits: tokenBits, isBase64url } = extractStatusList(token);
+    const effectiveBits = tokenBits || bits;
 
-    const lst = payload?.status_list?.lst;
-    const payloadBits = payload?.status_list?.bits ?? bits;
-
-    if (!lst) {
-        throw new Error(`Status list JWT from ${statusListRef.uri} missing status_list.lst`);
-    }
-
-    const status = getStatusFromBitstring(lst, statusListRef.index, payloadBits);
+    const status = getStatusFromBitstring(lst, statusListRef.index, effectiveBits, isBase64url);
     const revoked = status !== 0;
 
     return { revoked, status, statusListRef };
@@ -97,10 +139,10 @@ export async function checkTokenStatusList(statusListRef, options = {}) {
 /**
  * Re-checks credential status, bypassing cache by default.
  *
- * @param {{ uri: string, index: number }} statusListRef - status list reference
- * @param {object} options
- * @param {number} [options.cacheTtlMs=0] - cache TTL in ms (default 0 = always re-fetch)
- * @param {number} [options.bits=1] - bits per entry
+ * @param {{ uri: string, index: number }} statusListRef
+ * @param {object} [options]
+ * @param {number} [options.cacheTtlMs=0]
+ * @param {number} [options.bits=1]
  * @returns {Promise<{ revoked: boolean, status: number, checkedAt: string, statusListRef: object }>}
  */
 export async function recheckCredentialStatus(statusListRef, options = {}) {

@@ -162,3 +162,42 @@ export const validateCertificateAgainstIssuer = async (certificate, issuerCertif
 
     return null;
 };
+
+// OID to name mapping for common X.509 distinguished name attributes
+const DN_OID_MAP = {
+    '2.5.4.3': 'commonName',
+    '2.5.4.6': 'country',
+    '2.5.4.7': 'locality',
+    '2.5.4.8': 'state',
+    '2.5.4.10': 'organization',
+    '2.5.4.11': 'organizationalUnit',
+    '2.5.4.5': 'serialNumber',
+};
+
+/**
+ * Extract readable metadata from a PKIjs Certificate
+ * @param {Certificate} x509Cert - The X.509 certificate
+ * @returns {Object} Certificate info: subject, issuer, validity, serialNumber
+ */
+export const getCertificateInfo = (x509Cert) => {
+    if (!x509Cert) return null;
+
+    const extractDN = (rdnSequence) => {
+        const dn = {};
+        if (!rdnSequence?.typesAndValues) return dn;
+        for (const attr of rdnSequence.typesAndValues) {
+            const name = DN_OID_MAP[attr.type] || attr.type;
+            dn[name] = attr.value.valueBlock.value;
+        }
+        return dn;
+    };
+
+    return {
+        subject: extractDN(x509Cert.subject),
+        issuer: extractDN(x509Cert.issuer),
+        serialNumber: Array.from(new Uint8Array(x509Cert.serialNumber.valueBlock.valueHex))
+            .map(b => b.toString(16).padStart(2, '0')).join(':'),
+        notBefore: x509Cert.notBefore.value?.toISOString(),
+        notAfter: x509Cert.notAfter.value?.toISOString(),
+    };
+};

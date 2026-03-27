@@ -284,23 +284,53 @@ async function handleIndex(req, res) {
                 if (data.status === 'complete') {
                     const el = document.getElementById('status');
                     const resultEl = document.getElementById('result');
-                    if (data.result.valid) {
+                    const r = data.result;
+
+                    if (r.valid) {
                         el.className = 'success';
-                        el.textContent = 'Verification successful!';
+                        el.textContent = 'Verification Passed';
                     } else {
                         el.className = 'error';
-                        el.textContent = 'Verification failed';
+                        el.textContent = 'Verification Failed';
                     }
-                    let html = '<h3>Claims</h3><table>';
-                    for (const [key, val] of Object.entries(data.result.claims || {})) {
+
+                    const check = (val, label, desc) => {
+                        const icon = val ? '<span style="color:#2e7d32">&#10003;</span>' : '<span style="color:#c62828">&#10007;</span>';
+                        return '<li>' + icon + ' ' + label + ' <small style="color:#999">(' + desc + ')</small></li>';
+                    };
+
+                    let html = '<ul style="list-style:none;padding:0;margin:16px 0;font-size:15px">';
+                    html += check(r.credentialVerified, 'Credential Verified', 'signatures & digests');
+                    html += check(r.issuerTrusted, 'Issuer Trusted', 'certificate chain');
+                    html += check(!r.issuerRevoked, 'Issuer Not Revoked', 'CRL check');
+                    html += check(!r.credentialRevoked, 'Credential Not Revoked', 'status list');
+                    html += '</ul>';
+
+                    if (r.invalidReasons && r.invalidReasons.length > 0) {
+                        html += '<div style="background:#fff3f3;border:1px solid #ffcdd2;border-radius:8px;padding:12px;margin:12px 0;color:#c62828;font-size:14px"><strong>Issues:</strong><br>' + r.invalidReasons.join('<br>') + '</div>';
+                    }
+
+                    const issuerInfo = r.processedDocuments?.[0]?.issuer?.certificateInfo;
+                    if (issuerInfo) {
+                        html += '<div style="background:#f5f5f5;border-radius:8px;padding:12px;margin:12px 0;font-size:13px"><strong>Issuer Certificate</strong><dl style="margin:8px 0">';
+                        if (issuerInfo.subject?.commonName) html += '<dt style="font-weight:600;color:#666">Subject</dt><dd style="margin:0 0 8px 0">' + issuerInfo.subject.commonName + '</dd>';
+                        if (issuerInfo.subject?.organization) html += '<dt style="font-weight:600;color:#666">Organization</dt><dd style="margin:0 0 8px 0">' + issuerInfo.subject.organization + '</dd>';
+                        if (issuerInfo.subject?.country) html += '<dt style="font-weight:600;color:#666">Country</dt><dd style="margin:0 0 8px 0">' + issuerInfo.subject.country + '</dd>';
+                        if (issuerInfo.issuer?.commonName) html += '<dt style="font-weight:600;color:#666">Issued By</dt><dd style="margin:0 0 8px 0">' + issuerInfo.issuer.commonName + '</dd>';
+                        html += '<dt style="font-weight:600;color:#666">Valid</dt><dd style="margin:0 0 8px 0">' + (issuerInfo.notBefore?.split('T')[0] || '?') + ' to ' + (issuerInfo.notAfter?.split('T')[0] || '?') + '</dd>';
+                        html += '</dl></div>';
+                    }
+
+                    html += '<h3>Claims</h3><table style="width:100%;border-collapse:collapse">';
+                    for (const [key, val] of Object.entries(r.claims || {})) {
                         let display = val;
                         if (val instanceof Object && val.type === 'Buffer') display = '(binary data)';
                         else if (typeof val === 'object') display = JSON.stringify(val);
-                        if (key === 'portrait') display = '<img src="data:image/jpeg;base64,' + data.result.portraitBase64 + '" style="width:80px;border-radius:8px">';
-                        html += '<tr><th>' + key + '</th><td>' + display + '</td></tr>';
+                        if (key === 'portrait') display = '<img src="data:image/jpeg;base64,' + r.portraitBase64 + '" style="width:80px;border-radius:8px">';
+                        html += '<tr><th style="text-align:left;padding:8px 12px;border-bottom:1px solid #eee;color:#666;font-weight:500;font-size:13px;width:40%">' + key + '</th><td style="text-align:left;padding:8px 12px;border-bottom:1px solid #eee">' + display + '</td></tr>';
                     }
                     html += '</table>';
-                    html += '<details><summary>Full result</summary><pre>' + JSON.stringify(data.result, null, 2) + '</pre></details>';
+                    html += '<details><summary>Full result</summary><pre style="background:#f5f5f5;padding:16px;border-radius:8px;overflow-x:auto;font-size:12px">' + JSON.stringify(r, null, 2) + '</pre></details>';
                     resultEl.innerHTML = html;
                     return;
                 }
@@ -492,6 +522,9 @@ async function handleResponseUri(req, res) {
             nonce: session.nonce,
             responseUri: `${BASE_URL}/response`,
             mdocGeneratedNonce: session.mdocGeneratedNonce,
+            trustedCertificates: iacaPem ? [iacaPem] : undefined,
+            enableCrl: true,
+            enableStatusList: true,
         });
 
         console.log('\n--- Verification Result ---');
@@ -517,14 +550,22 @@ async function handleResponseUri(req, res) {
 
         session.result = {
             valid: result.valid,
-            trusted: result.trusted,
+            credentialVerified: result.credentialVerified,
+            issuerTrusted: result.issuerTrusted,
+            issuerRevoked: result.issuerRevoked,
+            credentialRevoked: result.credentialRevoked,
             claims: claimsForDisplay,
             portraitBase64,
+            invalidReasons: result.processedDocuments.flatMap(doc => doc.invalidReasons || []),
             processedDocuments: result.processedDocuments.map(doc => ({
                 valid: doc.valid,
-                trusted: doc.trusted,
+                credentialVerified: doc.credentialVerified,
+                issuerTrusted: doc.issuerTrusted,
+                issuerRevoked: doc.issuerRevoked,
+                credentialRevoked: doc.credentialRevoked,
                 invalidReasons: doc.invalidReasons,
-                issuer: doc.issuer ? { issuer_id: doc.issuer.issuer_id } : null,
+                issuer: doc.issuer || null,
+                statusListRef: doc.statusListRef || null,
             })),
         };
 
@@ -633,6 +674,13 @@ function route(req, res) {
         }
 
         const r = session.result;
+
+        const checkIcon = (val, label) => {
+            if (val === true) return `<span style="color:#2e7d32">&#10003;</span> ${label}`;
+            if (val === false) return `<span style="color:#c62828">&#10007;</span> ${label}`;
+            return `<span style="color:#999">&#8212;</span> ${label}`;
+        };
+
         let claimsHtml = '<table>';
         for (const [key, val] of Object.entries(r.claims || {})) {
             let display = val;
@@ -643,21 +691,51 @@ function route(req, res) {
         }
         claimsHtml += '</table>';
 
+        const title = r.valid ? 'Verification Passed' : 'Verification Failed';
+        const titleColor = r.valid ? '#2e7d32' : '#c62828';
+
         const html = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Verification Result</title>
 <style>
     body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; background: #f8f9fa; }
     .card { background: white; border-radius: 12px; padding: 24px; margin: 16px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-    h1 { color: ${r.valid ? '#2e7d32' : '#c62828'}; }
+    h1 { color: ${titleColor}; }
+    .checks { list-style: none; padding: 0; margin: 16px 0; font-size: 15px; }
+    .checks li { padding: 6px 0; border-bottom: 1px solid #f0f0f0; }
+    .checks span { font-weight: 600; font-size: 16px; margin-right: 8px; }
     table { width: 100%; border-collapse: collapse; }
     td, th { text-align: left; padding: 8px 12px; border-bottom: 1px solid #eee; }
     th { color: #666; font-weight: 500; font-size: 13px; width: 40%; }
+    .reasons { background: #fff3f3; border: 1px solid #ffcdd2; border-radius: 8px; padding: 12px; margin: 12px 0; color: #c62828; font-size: 14px; }
+    .issuer-info { background: #f5f5f5; border-radius: 8px; padding: 12px; margin: 12px 0; font-size: 13px; }
+    .issuer-info dt { font-weight: 600; color: #666; }
+    .issuer-info dd { margin: 0 0 8px 0; }
 </style>
 </head><body>
     <div class="card">
-        <h1>${r.valid ? 'Verification Successful' : 'Verification Complete (DeviceAuth pending)'}</h1>
-        <p>Claims received from wallet:</p>
+        <h1>${title}</h1>
+        <ul class="checks">
+            <li>${checkIcon(r.credentialVerified, 'Credential Verified')} <small>(signatures &amp; digests)</small></li>
+            <li>${checkIcon(r.issuerTrusted, 'Issuer Trusted')} <small>(certificate chain)</small></li>
+            <li>${checkIcon(!r.issuerRevoked, 'Issuer Not Revoked')} <small>(CRL check)</small></li>
+            <li>${checkIcon(!r.credentialRevoked, 'Credential Not Revoked')} <small>(status list)</small></li>
+        </ul>
+        ${r.invalidReasons?.length ? `<div class="reasons"><strong>Issues:</strong><br>${r.invalidReasons.join('<br>')}</div>` : ''}
+        ${r.processedDocuments?.[0]?.issuer?.certificateInfo ? `
+        <div class="issuer-info">
+            <strong>Issuer Certificate</strong>
+            <dl>
+                ${r.processedDocuments[0].issuer.certificateInfo.subject?.commonName ? `<dt>Subject</dt><dd>${r.processedDocuments[0].issuer.certificateInfo.subject.commonName}</dd>` : ''}
+                ${r.processedDocuments[0].issuer.certificateInfo.subject?.organization ? `<dt>Organization</dt><dd>${r.processedDocuments[0].issuer.certificateInfo.subject.organization}</dd>` : ''}
+                ${r.processedDocuments[0].issuer.certificateInfo.subject?.country ? `<dt>Country</dt><dd>${r.processedDocuments[0].issuer.certificateInfo.subject.country}</dd>` : ''}
+                ${r.processedDocuments[0].issuer.certificateInfo.issuer?.commonName ? `<dt>Issued By</dt><dd>${r.processedDocuments[0].issuer.certificateInfo.issuer.commonName}</dd>` : ''}
+                <dt>Valid</dt><dd>${r.processedDocuments[0].issuer.certificateInfo.notBefore?.split('T')[0] || '?'} to ${r.processedDocuments[0].issuer.certificateInfo.notAfter?.split('T')[0] || '?'}</dd>
+            </dl>
+        </div>` : ''}
+    </div>
+    <div class="card">
+        <h2>Claims</h2>
         ${claimsHtml}
     </div>
 </body></html>`;
@@ -699,12 +777,13 @@ function route(req, res) {
 // Startup
 // ---------------------------------------------------------------------------
 let readerAuth;
+let iacaPem;
 
 async function start() {
     console.log('=== OID4VP Redirect Flow Test Server ===\n');
 
     // Load IACA
-    const iacaPem = fs.readFileSync(IACA_PATH, 'utf-8');
+    iacaPem = fs.readFileSync(IACA_PATH, 'utf-8');
     console.log('IACA loaded from:', IACA_PATH);
 
     // Generate reader auth key + cert
