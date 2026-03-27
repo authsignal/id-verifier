@@ -41,15 +41,20 @@ class OID4VPRedirectHelper {
      * Creates an OID4VP authorization request URL for redirect-based flows.
      *
      * @param {object} options
-     * @param {string} options.clientId
+     * @param {string} options.clientId - The client identifier value
      * @param {string} options.requestUri
      * @param {string} [options.walletScheme] - defaults to 'openid4vp://'
      * @param {string} [options.requestUriMethod] - e.g. 'post'
+     * @param {string} [options.clientIdScheme] - If set, added as separate param (pre-1.0 / ISO 18013-7 format).
+     *   When provided, clientId should be the plain value (e.g. DNS name), not prefixed.
      * @returns {string}
      */
-    createAuthorizationRequestUrl({ clientId, requestUri, walletScheme = WalletScheme.OPENID4VP, requestUriMethod } = {}) {
+    createAuthorizationRequestUrl({ clientId, requestUri, walletScheme = WalletScheme.OPENID4VP, requestUriMethod, clientIdScheme } = {}) {
         const params = new URLSearchParams();
         params.set('client_id', clientId);
+        if (clientIdScheme) {
+            params.set('client_id_scheme', clientIdScheme);
+        }
         params.set('request_uri', requestUri);
         if (requestUriMethod !== undefined && requestUriMethod !== null) {
             params.set('request_uri_method', requestUriMethod);
@@ -104,23 +109,38 @@ class OID4VPRedirectHelper {
         clientId, nonce, state, responseUri, documentTypes, claims,
         privateKey, x5cChain, encryptionJwk, walletNonce,
         responseMode = ResponseMode.DIRECT_POST_JWT,
+        usePresentationExchange = false,
+        clientIdScheme,
+        typ = 'oauth-authz-req+jwt',
+        kid,
     }) {
-        const credentials = documentTypes.map(docType => ({
-            id: createCredentialId(CredentialFormat.MSO_MDOC, docType),
-            format: CredentialFormat.MSO_MDOC,
-            meta: { doctype_value: docType },
-            claims: claims.map(c => ({ path: c })),
-        }));
-
         const payload = {
+            aud: 'https://self-issued.me/v2',
             client_id: clientId,
             nonce,
             state,
             response_uri: responseUri,
             response_type: 'vp_token',
             response_mode: responseMode,
-            dcql_query: { credentials },
         };
+
+        if (clientIdScheme) {
+            payload.client_id_scheme = clientIdScheme;
+        }
+
+        if (usePresentationExchange) {
+            // ISO 18013-7 / OID4VP draft 18 format — Presentation Exchange
+            payload.presentation_definition = this._createPresentationDefinition(documentTypes, claims);
+        } else {
+            // OID4VP 1.0 format — DCQL
+            const credentials = documentTypes.map(docType => ({
+                id: createCredentialId(CredentialFormat.MSO_MDOC, docType),
+                format: CredentialFormat.MSO_MDOC,
+                meta: { doctype_value: docType },
+                claims: claims.map(c => ({ path: c })),
+            }));
+            payload.dcql_query = { credentials };
+        }
 
         if (walletNonce !== undefined && walletNonce !== null) {
             payload.wallet_nonce = walletNonce;
@@ -130,15 +150,21 @@ class OID4VPRedirectHelper {
             // Strip private key material — only embed public key in the JWT payload
             const { d, dp, dq, qi, ...publicJwk } = encryptionJwk;
             payload.client_metadata = {
-                encrypted_response_alg_values_supported: ['ECDH-ES'],
-                encrypted_response_enc_values_supported: ['A256GCM', 'A128GCM'],
+                authorization_encrypted_response_alg: 'ECDH-ES',
+                authorization_encrypted_response_enc: 'A256GCM',
+                vp_formats: {
+                    mso_mdoc: {
+                        alg: ['ES256', 'ES384', 'ES512'],
+                    },
+                },
+                require_signed_request_object: true,
                 jwks: {
-                    keys: [{ ...publicJwk, use: 'enc', kid: 'ephemeral-enc-key' }],
+                    keys: [{ ...publicJwk, use: 'enc', kid: 'ephemeral-enc-key', alg: 'ECDH-ES' }],
                 },
             };
         }
 
-        return signRequestObject(payload, privateKey, x5cChain);
+        return signRequestObject(payload, privateKey, x5cChain, 'ES256', { typ, kid, includeIat: !usePresentationExchange });
     }
 
     /**
@@ -262,6 +288,41 @@ class OID4VPRedirectHelper {
         }
 
         return { vpToken, state };
+    }
+
+    /**
+     * Build a Presentation Exchange presentation_definition for ISO 18013-7 / OID4VP draft 18.
+     * This is the legacy format that older wallets (MATTR, etc.) expect.
+     *
+     * @param {string[]} documentTypes
+     * @param {Array<[string, string]>} claims - [namespace, element] pairs
+     * @returns {Object} presentation_definition
+     */
+    _createPresentationDefinition(documentTypes, claims) {
+        const inputDescriptors = documentTypes.map((docType, idx) => {
+            const fields = claims.map(([namespace, element]) => ({
+                path: [`$['${namespace}']['${element}']`],
+                intent_to_retain: false,
+            }));
+
+            return {
+                id: `${docType}`,
+                format: {
+                    mso_mdoc: {
+                        alg: ['ES256'],
+                    },
+                },
+                constraints: {
+                    limit_disclosure: 'required',
+                    fields,
+                },
+            };
+        });
+
+        return {
+            id: crypto.randomUUID(),
+            input_descriptors: inputDescriptors,
+        };
     }
 }
 

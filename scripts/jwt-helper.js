@@ -8,11 +8,13 @@ import { SignJWT, importJWK, compactDecrypt } from 'jose';
  * @param {string} alg - Signing algorithm (default: 'ES256')
  * @returns {Promise<string>} Signed JWT
  */
-export async function signRequestObject(payload, privateKey, x5cChain, alg = 'ES256') {
-    return new SignJWT(payload)
-        .setProtectedHeader({ alg, typ: 'oauth-authz-req+jwt', x5c: x5cChain })
-        .setIssuedAt()
-        .sign(privateKey);
+export async function signRequestObject(payload, privateKey, x5cChain, alg = 'ES256', { typ, kid, includeIat = true } = {}) {
+    const header = { alg, x5c: x5cChain };
+    if (typ) header.typ = typ;
+    if (kid) header.kid = kid;
+    const builder = new SignJWT(payload).setProtectedHeader(header);
+    if (includeIat) builder.setIssuedAt();
+    return builder.sign(privateKey);
 }
 
 /**

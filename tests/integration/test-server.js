@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 import * as jose from 'jose';
 import { Certificate } from 'pkijs';
 import { Integer } from 'asn1js';
+import QRCode from 'qrcode';
 
 import {
     createAuthorizationRequestUrl,
@@ -56,6 +57,7 @@ const PORT = parseInt(getArg('port', '8443'), 10);
 const WALLET_SCHEME = getArg('scheme', 'mdoc-openid4vp://');
 const DOC_TYPE = getArg('doctype', 'org.iso.18013.5.1.mDL');
 const USE_HTTP = hasFlag('http');
+const BASE_URL_OVERRIDE = getArg('base-url', null);
 
 if (!IACA_PATH) {
     console.error('Error: --iaca <path> is required (path to IACA PEM certificate)');
@@ -81,7 +83,7 @@ function getLanIP() {
 }
 const HOST = getLanIP();
 const PROTOCOL = USE_HTTP ? 'http' : 'https';
-const BASE_URL = `${PROTOCOL}://${HOST}:${PORT}`;
+const BASE_URL = BASE_URL_OVERRIDE || `${PROTOCOL}://${HOST}:${PORT}`;
 
 // ---------------------------------------------------------------------------
 // Generate self-signed TLS cert + reader auth cert at startup
@@ -107,29 +109,56 @@ async function generateSelfSignedCert() {
 }
 
 async function generateReaderKeyAndCert() {
-    const keyPair = await crypto.subtle.generateKey(
-        { name: 'ECDSA', namedCurve: 'P-256' },
-        true,
-        ['sign', 'verify']
+    // Generate reader cert with dNSName SAN matching the BASE_URL hostname
+    // This is required for x509_san_dns — the wallet checks the SAN
+    const baseHost = new URL(BASE_URL).hostname;
+    const readerKeyPath = path.join(CERT_DIR, 'reader-key.pem');
+    const readerCertPath = path.join(CERT_DIR, 'reader-cert.pem');
+
+    if (!fs.existsSync(CERT_DIR)) fs.mkdirSync(CERT_DIR, { recursive: true });
+
+    execSync(
+        `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -pkeyopt ec_param_enc:named_curve ` +
+        `-keyout "${readerKeyPath}" -out "${readerCertPath}" -days 30 -nodes ` +
+        `-subj "/CN=${baseHost}" ` +
+        `-addext "subjectAltName=DNS:${baseHost}" 2>/dev/null`
     );
 
-    const cert = new Certificate();
-    cert.version = 2;
-    cert.serialNumber = new Integer({ value: Date.now() });
-    await cert.subjectPublicKeyInfo.importKey(keyPair.publicKey);
-    cert.notBefore.value = new Date();
-    cert.notAfter.value = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
-    await cert.sign(keyPair.privateKey, 'SHA-256');
+    // Read the PEM files
+    const keyPem = fs.readFileSync(readerKeyPath, 'utf-8');
+    const certPem = fs.readFileSync(readerCertPath, 'utf-8');
 
-    const certDer = new Uint8Array(cert.toSchema().toBER(false));
-    const x5cChain = certToX5cChain([certDer]);
-    const hash = await generateX509Hash(certDer);
-    const clientId = `x509_hash:${hash}`;
-
-    const privateJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
+    // Import private key as Web Crypto (extractable) then convert for jose
+    const privateKeyObj = await crypto.subtle.importKey(
+        'pkcs8',
+        Buffer.from(keyPem.replace(/-----BEGIN PRIVATE KEY-----/, '').replace(/-----END PRIVATE KEY-----/, '').replace(/\s/g, ''), 'base64'),
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        true,
+        ['sign']
+    );
+    const privateJwk = await crypto.subtle.exportKey('jwk', privateKeyObj);
     const signingKey = await jose.importJWK(privateJwk, 'ES256');
 
-    return { clientId, signingKey, x5cChain };
+    // Export public key JWK for .well-known/oauth-client
+    const kid = crypto.randomUUID();
+    const { d: _d, ...publicKeyJwk } = privateJwk;
+    publicKeyJwk.kid = kid;
+    publicKeyJwk.alg = 'ES256';
+    publicKeyJwk.use = 'sig';
+
+    // Get DER bytes of cert for x5c chain and x509_hash
+    const certBase64 = certPem
+        .replace(/-----BEGIN CERTIFICATE-----/, '')
+        .replace(/-----END CERTIFICATE-----/, '')
+        .replace(/\s/g, '');
+    const certDer = Buffer.from(certBase64, 'base64');
+    const x5cChain = [certBase64]; // x5c is base64-encoded DER
+    const hash = await generateX509Hash(new Uint8Array(certDer));
+    const clientId = `x509_hash:${hash}`;
+
+    console.log('Reader cert SAN:', `DNS:${baseHost}`);
+
+    return { clientId, signingKey, x5cChain, publicKeyJwk, kid };
 }
 
 // ---------------------------------------------------------------------------
@@ -181,12 +210,18 @@ async function handleIndex(req, res) {
 
     const requestUri = `${BASE_URL}/request/${session.id}`;
 
+    // Use the hostname from BASE_URL as client_id with x509_san_dns scheme
+    // This matches the format MATTR wallet expects (ISO 18013-7 style)
+    const baseHost = new URL(BASE_URL).hostname;
+
     const authUrl = createAuthorizationRequestUrl({
-        clientId: readerAuth.clientId,
+        clientId: baseHost,
+        clientIdScheme: 'x509_san_dns',
         requestUri,
         walletScheme: WALLET_SCHEME,
-        requestUriMethod: 'post',
     });
+
+    const qrSvg = await QRCode.toString(authUrl, { type: 'svg', width: 300, margin: 2, color: { dark: '#1a1a2e' } });
 
     const html = `<!DOCTYPE html>
 <html>
@@ -194,13 +229,12 @@ async function handleIndex(req, res) {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>OID4VP Redirect Flow Test</title>
-    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
     <style>
         body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #f8f9fa; }
         .card { background: white; border-radius: 12px; padding: 24px; margin: 16px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
         h1 { color: #1a1a2e; }
         .qr-container { text-align: center; margin: 24px 0; }
-        canvas { border: 8px solid white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+        .qr-container svg { border: 8px solid white; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
         .url { word-break: break-all; font-family: monospace; font-size: 12px; background: #f0f0f0; padding: 12px; border-radius: 6px; margin: 12px 0; }
         .info { color: #666; font-size: 14px; }
         .badge { display: inline-block; background: #e8f5e9; color: #2e7d32; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
@@ -220,13 +254,14 @@ async function handleIndex(req, res) {
     <div class="card">
         <h2>Scan with MATTR Wallet</h2>
         <div class="qr-container">
-            <canvas id="qr"></canvas>
+            ${qrSvg}
         </div>
         <div class="info">
             <strong>Session:</strong> ${session.id}<br>
             <strong>Scheme:</strong> <span class="badge">${WALLET_SCHEME}</span>
             <strong>DocType:</strong> <span class="badge">${DOC_TYPE}</span>
         </div>
+        <a href="${authUrl}" style="display:block;text-align:center;margin:16px 0;padding:14px 24px;background:#1a1a2e;color:white;border-radius:8px;text-decoration:none;font-weight:600;font-size:16px;">Open in Wallet</a>
         <details>
             <summary>Authorization URL</summary>
             <div class="url">${authUrl}</div>
@@ -240,12 +275,6 @@ async function handleIndex(req, res) {
     </div>
 
     <script>
-        QRCode.toCanvas(document.getElementById('qr'), ${JSON.stringify(authUrl)}, {
-            width: 300,
-            margin: 2,
-            color: { dark: '#1a1a2e' }
-        });
-
         // Poll for result
         const sessionId = ${JSON.stringify(session.id)};
         async function poll() {
@@ -311,13 +340,16 @@ async function handleRequestUri(req, res, sessionId) {
         }
     }
 
-    // Get public part of encryption JWK
-    const { d, dp, dq, qi, ...encPublicJwk } = session.encJwk;
-
     const claims = DEFAULT_CLAIMS[DOC_TYPE] || DEFAULT_CLAIMS['org.iso.18013.5.1.mDL'];
 
+    const baseHost = new URL(BASE_URL).hostname;
+
+    // Get public part of encryption JWK for client_metadata
+    const { d, dp, dq, qi, ...encPublicJwk } = session.encJwk;
+
     const jwt = await createRequestObject({
-        clientId: readerAuth.clientId,
+        clientId: baseHost,
+        clientIdScheme: 'x509_san_dns',
         nonce: session.nonce,
         state: session.state,
         responseUri: `${BASE_URL}/response`,
@@ -325,13 +357,17 @@ async function handleRequestUri(req, res, sessionId) {
         claims,
         privateKey: readerAuth.signingKey,
         x5cChain: readerAuth.x5cChain,
-        encryptionJwk: encPublicJwk,
         walletNonce,
+        responseMode: 'direct_post.jwt',
+        usePresentationExchange: true,
+        encryptionJwk: encPublicJwk,
+        typ: null,
+        kid: readerAuth.kid,
     });
 
     console.log('\n--- Serving request object ---');
     console.log('Session:', sessionId);
-    console.log('Client ID:', readerAuth.clientId);
+    console.log('Client ID:', baseHost);
     console.log('Nonce:', session.nonce);
     console.log('Response URI:', `${BASE_URL}/response`);
 
@@ -351,41 +387,68 @@ async function handleResponseUri(req, res) {
     }
 
     console.log('Keys:', Object.keys(responseBody));
+    console.log('Raw body (first 500 chars):', body.substring(0, 500));
 
     // Find the session by state
     let session = null;
-    const stateFromBody = responseBody.state;
+    let vpToken = null;
+    let state = null;
 
-    // For encrypted responses, we need to try each session's key
-    // First try to find by state if available in plain
-    if (stateFromBody) {
-        for (const s of sessions.values()) {
-            if (s.state === stateFromBody) { session = s; break; }
-        }
+    // For plain direct_post: vp_token and state are form fields
+    if (responseBody.vp_token) {
+        state = responseBody.state;
+        // vp_token for mdoc is base64url-encoded DeviceResponse
+        vpToken = responseBody.vp_token;
+        console.log('Plain direct_post — state:', state);
     }
 
-    // If encrypted (direct_post.jwt), state is inside the JWE — try recent sessions
-    if (!session && responseBody.response) {
-        // Try each recent session's encryption key
+    // For encrypted direct_post.jwt: single "response" field containing JWE
+    if (responseBody.response) {
+        console.log('Attempting JWE decryption...');
         for (const s of sessions.values()) {
-            if (s.result) continue; // skip already-completed sessions
+            if (s.result) continue;
+            console.log('Trying session:', s.id);
             try {
-                const { state } = await processDirectPostResponse({
-                    responseBody,
-                    encryptionJwk: s.encJwk,
-                });
-                if (state === s.state) {
-                    session = s;
-                    break;
+                // Decrypt the JWE directly — the wallet may send raw CBOR (ISO 18013-7)
+                // or JSON (OID4VP 1.0) inside the JWE
+                const privateKey = await jose.importJWK(s.encJwk, 'ECDH-ES');
+                const { plaintext } = await jose.compactDecrypt(responseBody.response, privateKey);
+                console.log('Decryption succeeded! Plaintext length:', plaintext.length);
+
+                // Check if it's JSON or CBOR
+                let decoded;
+                try {
+                    decoded = JSON.parse(new TextDecoder().decode(plaintext));
+                    console.log('Plaintext is JSON:', Object.keys(decoded));
+                    vpToken = typeof decoded.vp_token === 'string' ? decoded.vp_token : JSON.stringify(decoded.vp_token);
+                    state = decoded.state;
+                } catch {
+                    // Not JSON — it's raw CBOR DeviceResponse (ISO 18013-7 format)
+                    console.log('Plaintext is CBOR (ISO 18013-7 format)');
+                    const { bufferToBase64Url } = await import('../../scripts/utils.js');
+                    vpToken = bufferToBase64Url(plaintext);
+                    state = s.state; // State not in payload — use session's state
                 }
+
+                session = s;
+                break;
             } catch (e) {
-                continue; // wrong key, try next
+                console.error('Decryption failed for session', s.id, ':', e.message);
+                continue;
             }
         }
     }
 
+    // Match session by state
+    if (!session && state) {
+        for (const s of sessions.values()) {
+            if (s.state === state) { session = s; break; }
+        }
+    }
+
     if (!session) {
-        console.error('No matching session found');
+        console.error('No matching session found. State:', state);
+        console.error('Available sessions:', [...sessions.keys()]);
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'No matching session' }));
         return;
@@ -394,25 +457,31 @@ async function handleResponseUri(req, res) {
     console.log('Matched session:', session.id);
 
     try {
-        // Decrypt the response
-        const { vpToken, state } = await processDirectPostResponse({
-            responseBody,
-            encryptionJwk: session.encJwk,
-        });
+        // For plain direct_post with ISO 18013-7 wallets, vp_token is the raw
+        // base64url-encoded DeviceResponse, not a JSON object keyed by credential ID.
+        // We need to handle both formats.
+        let vpTokenObj = vpToken;
+        if (typeof vpToken === 'string') {
+            // Check if it's JSON (OID4VP 1.0 format) or raw base64url (ISO 18013-7 format)
+            try {
+                vpTokenObj = JSON.parse(vpToken);
+            } catch {
+                // It's a raw base64url DeviceResponse — wrap it in the expected format
+                const credId = `cred-mso_mdoc-${DOC_TYPE.replace(/[^a-zA-Z0-9]/g, '_')}`;
+                vpTokenObj = { [credId]: [vpToken] };
+                console.log('Wrapped raw vp_token as:', credId);
+            }
+        }
 
-        console.log('State:', state);
-        console.log('VP Token keys:', Object.keys(vpToken));
-
-        // Get public part of encryption JWK for thumbprint
-        const { d, dp, dq, qi, ...encPublicJwk } = session.encJwk;
+        console.log('VP Token keys:', typeof vpTokenObj === 'object' ? Object.keys(vpTokenObj) : typeof vpTokenObj);
 
         // Verify the credentials
+        const baseHost = new URL(BASE_URL).hostname;
         const result = await verifyRedirectResponse({
-            vpToken,
-            clientId: readerAuth.clientId,
+            vpToken: vpTokenObj,
+            clientId: baseHost,
             nonce: session.nonce,
             responseUri: `${BASE_URL}/response`,
-            encryptionJwk: encPublicJwk,
         });
 
         console.log('\n--- Verification Result ---');
@@ -449,8 +518,15 @@ async function handleResponseUri(req, res) {
             })),
         };
 
-        // Respond to wallet
-        const walletResponse = createDirectPostSuccessResponse({});
+        // Respond to wallet — include redirect_uri for same-device flow
+        const walletResponse = createDirectPostSuccessResponse({
+            redirectUri: `${BASE_URL}/callback`,
+        });
+        // Store response_code for callback lookup
+        if (walletResponse.response_code) {
+            session.responseCode = walletResponse.response_code;
+        }
+        console.log('Wallet response:', JSON.stringify(walletResponse));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(walletResponse));
 
@@ -527,6 +603,77 @@ function route(req, res) {
 
     if (pathname === '/response' && req.method === 'POST') {
         return handleResponseUri(req, res);
+    }
+
+    if (pathname === '/callback' && req.method === 'GET') {
+        const url = new URL(req.url, BASE_URL);
+        const responseCode = url.searchParams.get('response_code');
+        console.log('Callback with response_code:', responseCode);
+
+        // Find session by response_code
+        let session = null;
+        for (const s of sessions.values()) {
+            if (s.responseCode === responseCode) { session = s; break; }
+        }
+
+        if (!session || !session.result) {
+            res.writeHead(400, { 'Content-Type': 'text/html' });
+            res.end('<h1>Invalid or expired response code</h1>');
+            return;
+        }
+
+        const r = session.result;
+        let claimsHtml = '<table>';
+        for (const [key, val] of Object.entries(r.claims || {})) {
+            let display = val;
+            if (key === 'portrait' && r.portraitBase64) {
+                display = `<img src="data:image/jpeg;base64,${r.portraitBase64}" style="width:80px;border-radius:8px">`;
+            }
+            claimsHtml += `<tr><th>${key}</th><td>${display}</td></tr>`;
+        }
+        claimsHtml += '</table>';
+
+        const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verification Result</title>
+<style>
+    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; background: #f8f9fa; }
+    .card { background: white; border-radius: 12px; padding: 24px; margin: 16px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    h1 { color: ${r.valid ? '#2e7d32' : '#c62828'}; }
+    table { width: 100%; border-collapse: collapse; }
+    td, th { text-align: left; padding: 8px 12px; border-bottom: 1px solid #eee; }
+    th { color: #666; font-weight: 500; font-size: 13px; width: 40%; }
+</style>
+</head><body>
+    <div class="card">
+        <h1>${r.valid ? 'Verification Successful' : 'Verification Complete (DeviceAuth pending)'}</h1>
+        <p>Claims received from wallet:</p>
+        ${claimsHtml}
+    </div>
+</body></html>`;
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(html);
+        return;
+    }
+
+    // OAuth client metadata endpoint — wallet may request this for x509_san_dns validation
+    if (pathname === '/.well-known/oauth-client' || pathname === '/.well-known/openid-credential-verifier') {
+        const metadata = {
+            jwks: {
+                keys: [readerAuth.publicKeyJwk],
+            },
+            authorization_encrypted_response_enc: 'A256GCM',
+            authorization_encrypted_response_alg: 'ECDH-ES',
+            vp_formats: {
+                mso_mdoc: {
+                    alg: ['ES256', 'ES384', 'ES512'],
+                },
+            },
+            require_signed_request_object: true,
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(metadata));
+        return;
     }
 
     const resultMatch = pathname.match(/^\/result\/(.+)$/);
