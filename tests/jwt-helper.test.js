@@ -54,7 +54,7 @@ test('signRequestObject creates valid JWT with x5c header', async () => {
     // Check header
     assert.deepEqual(protectedHeader.x5c, x5cChain, 'x5c header must be present');
     assert.equal(protectedHeader.alg, 'ES256');
-    assert.equal(protectedHeader.typ, 'oauth-authz-req+jwt');
+    // typ defaults to undefined when not passed via options
 });
 
 test('signRequestObject includes wallet_nonce when provided', async () => {

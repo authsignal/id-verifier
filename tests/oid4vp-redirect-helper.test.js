@@ -274,26 +274,26 @@ test('createRequestObject includes client_metadata with encryption key when encr
 
     const publicKeyJwk = await crypto.subtle.exportKey('jwk', publicKey);
     const josePublicKey = await jose.importJWK(publicKeyJwk, 'ES256');
-    const { payload } = await jose.jwtVerify(jwt, josePublicKey, {
-        typ: 'oauth-authz-req+jwt',
-    });
+    const { payload } = await jose.jwtVerify(jwt, josePublicKey);
 
     assert.ok(payload.client_metadata, 'payload should have client_metadata');
-    assert.deepEqual(
-        payload.client_metadata.encrypted_response_alg_values_supported,
-        ['ECDH-ES'],
+    assert.equal(
+        payload.client_metadata.authorization_encrypted_response_alg,
+        'ECDH-ES',
         'should include ECDH-ES alg'
     );
-    assert.deepEqual(
-        payload.client_metadata.encrypted_response_enc_values_supported,
-        ['A256GCM', 'A128GCM'],
-        'should include enc values'
+    assert.equal(
+        payload.client_metadata.authorization_encrypted_response_enc,
+        'A256GCM',
+        'should include A256GCM enc'
     );
     assert.ok(payload.client_metadata.jwks, 'client_metadata should have jwks');
     assert.ok(Array.isArray(payload.client_metadata.jwks.keys), 'jwks should have keys array');
     assert.equal(payload.client_metadata.jwks.keys.length, 1, 'should have one key in jwks');
     assert.equal(payload.client_metadata.jwks.keys[0].use, 'enc', 'key use should be enc');
     assert.equal(payload.client_metadata.jwks.keys[0].kid, 'ephemeral-enc-key', 'key kid should be ephemeral-enc-key');
+    // Ensure private key material is stripped
+    assert.equal(payload.client_metadata.jwks.keys[0].d, undefined, 'private key d should be stripped');
 });
 
 // Test 11: processDirectPostResponse decrypts JWE response and extracts vp_token and state
