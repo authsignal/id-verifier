@@ -19,6 +19,21 @@ export const parseX5Chain = (x5chain) => {
 };
 
 /**
+ * Parse all certificates from a X.509 chain into an array of PKIjs Certificate objects
+ * @param {Array|Uint8Array} x5chain - The X.509 chain (array of DER-encoded certs or a single cert)
+ * @returns {Certificate[]} - Array of parsed Certificate objects
+ */
+export const parseX5ChainAll = (x5chain) => {
+    if (!x5chain) return [];
+    const certs = x5chain instanceof Array ? x5chain : [x5chain];
+    return certs.map(certBytes => {
+        const arrayBuffer = certBytes.buffer.slice(certBytes.byteOffset, certBytes.byteOffset + certBytes.byteLength);
+        const asn1 = asn1js.fromBER(arrayBuffer);
+        return new Certificate({ schema: asn1.result });
+    });
+};
+
+/**
  * Get the AuthorityKeyIdentifier from a X.509 certificate
  * @param {Certificate} x509Cert - The X.509 certificate
  * @returns {string} - The AuthorityKeyIdentifier in base64url format
