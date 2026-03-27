@@ -1,5 +1,6 @@
 import * as cbor2 from 'cbor2';
 import { getIssuer } from '../trusted-issuer-registry-helper.js';
+import { verifyIssuerTrust } from '../issuer-verifier.js';
 import { REVERSE_CLAIM_MAPPINGS, CredentialFormat } from '../constants.js';
 import { parseX5Chain, x509ToWebCryptoKey } from '../certificate-helper.js';
 import { verifyCoseSign1, coseKeyToWebCryptoKey } from '../cose-helper.js';
@@ -11,7 +12,7 @@ export const decodeVpToken = async (vp_token) => {
     return decoded;
 };
 
-export const verifyDocument = async (document, sessionTranscript) => {
+export const verifyDocument = async (document, sessionTranscript, verificationOptions = {}) => {
     const claims = {};
     const invalidReasons = [];
     const { docType, issuerSigned, deviceSigned } = document;
@@ -30,7 +31,22 @@ export const verifyDocument = async (document, sessionTranscript) => {
             }
         }
     }
-    const issuer = await getIssuer(certificate);
+    // Determine issuer trust
+    let issuer = null;
+    if (verificationOptions.trustedCertificates) {
+        const trustResult = await verifyIssuerTrust(certificate, {
+            trustedCertificates: verificationOptions.trustedCertificates,
+        });
+        if (trustResult.trusted) {
+            issuer = {
+                trusted: true,
+                certificate: { data: trustResult.matchedCertificate, format: 'pem' },
+            };
+        }
+    } else {
+        // Fall back to trusted-issuer-registry
+        issuer = await getIssuer(certificate);
+    }
     return {
         claims: claims,
         issuer: issuer,

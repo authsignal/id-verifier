@@ -208,7 +208,7 @@ class OID4VPRedirectHelper {
      * @param {string[]} [options.trustLists] - Trust list identifiers; defaults to ALL_TRUST_LISTS
      * @returns {Promise<{ claims, valid, trusted, processedDocuments, sessionTranscript }>}
      */
-    async verify({ vpToken, clientId, nonce, responseUri, encryptionJwk, mdocGeneratedNonce, trustLists = ALL_TRUST_LISTS }) {
+    async verify({ vpToken, clientId, nonce, responseUri, encryptionJwk, mdocGeneratedNonce, trustLists = ALL_TRUST_LISTS, trustedCertificates }) {
         let sessionTranscript;
 
         if (mdocGeneratedNonce) {
@@ -237,17 +237,19 @@ class OID4VPRedirectHelper {
             for (const token of tokens) {
                 const decoded = await decodeVpToken(token);
                 for (const doc of decoded.documents) {
-                    const { claims, issuer, valid: docValid, invalidReasons } = await verifyDocument(doc, sessionTranscript);
+                    const { claims, issuer, valid: docValid, invalidReasons } = await verifyDocument(doc, sessionTranscript, { trustedCertificates });
 
                     Object.assign(allClaims, claims);
 
                     if (!docValid) valid = false;
 
-                    const issuerTrusted = issuer && (
-                        trustLists === ALL_TRUST_LISTS ||
-                        (Array.isArray(trustLists) && trustLists.includes('all_trust_lists')) ||
-                        issuer.certificate?.trust_lists?.some(tl => trustLists.includes(tl))
-                    );
+                    const issuerTrusted = trustedCertificates
+                        ? (issuer?.trusted === true)
+                        : (issuer && (
+                            trustLists === ALL_TRUST_LISTS ||
+                            (Array.isArray(trustLists) && trustLists.includes('all_trust_lists')) ||
+                            issuer.certificate?.trust_lists?.some(tl => trustLists.includes(tl))
+                        ));
                     if (!issuerTrusted) trusted = false;
 
                     processedDocuments.push({ claims, issuer, valid: docValid, trusted: !!issuerTrusted, invalidReasons });

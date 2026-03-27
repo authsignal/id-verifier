@@ -220,6 +220,7 @@ export const processDirectPostResponse = async (options) => {
 /**
  * Verify mdoc credentials from an OID4VP redirect flow response.
  * @param {Object} options - See OID4VPRedirectHelper.verify
+ * @param {string[]} [options.trustedCertificates] - Array of PEM-encoded trusted root/IACA certificates
  * @returns {Promise<Object>} { claims, valid, trusted, processedDocuments, sessionTranscript }
  */
 export const verifyRedirectResponse = async (options) => {
