@@ -1,6 +1,7 @@
 import * as cbor2 from 'cbor2';
 import { getIssuer } from '../trusted-issuer-registry-helper.js';
-import { verifyIssuerTrust } from '../issuer-verifier.js';
+import { verifyIssuerTrustAndRevocation } from '../issuer-verifier.js';
+import { checkTokenStatusList } from '../status-list-helper.js';
 import { REVERSE_CLAIM_MAPPINGS, CredentialFormat } from '../constants.js';
 import { parseX5Chain, x509ToWebCryptoKey } from '../certificate-helper.js';
 import { verifyCoseSign1, coseKeyToWebCryptoKey } from '../cose-helper.js';
@@ -33,10 +34,16 @@ export const verifyDocument = async (document, sessionTranscript, verificationOp
     }
     // Determine issuer trust
     let issuer = null;
+    let revoked = false;
+    let statusListRef = null;
+
     if (verificationOptions.trustedCertificates) {
-        const trustResult = await verifyIssuerTrust(certificate, {
+        const trustResult = await verifyIssuerTrustAndRevocation(certificate, {
             trustedCertificates: verificationOptions.trustedCertificates,
+            enableCrl: verificationOptions.enableCrl,
+            crlCacheTtlMs: verificationOptions.crlCacheTtlMs,
         });
+        revoked = trustResult.revoked;
         if (trustResult.trusted) {
             issuer = {
                 trusted: true,
@@ -47,11 +54,33 @@ export const verifyDocument = async (document, sessionTranscript, verificationOp
         // Fall back to trusted-issuer-registry
         issuer = await getIssuer(certificate);
     }
+
+    // Check Token Status List if present in MSO and enabled
+    if (issuerAuthPayload.status && verificationOptions.enableStatusList) {
+        const statusInfo = issuerAuthPayload.status;
+        if (statusInfo.statusList) {
+            statusListRef = {
+                uri: statusInfo.statusList.uri,
+                index: statusInfo.statusList.idx,
+            };
+            const statusResult = await checkTokenStatusList(statusListRef, {
+                enabled: true,
+                cacheTtlMs: verificationOptions.statusListCacheTtlMs,
+            });
+            if (statusResult.revoked) revoked = true;
+        }
+    }
+
     return {
         claims: claims,
         issuer: issuer,
-        valid: valid && deviceValid && claimsValid,
-        invalidReasons: invalidReasons,
+        valid: valid && deviceValid && claimsValid && !revoked,
+        revoked,
+        statusListRef,
+        invalidReasons: [
+            ...invalidReasons,
+            ...(revoked ? ['Certificate or credential revoked'] : []),
+        ],
     };
 };
 

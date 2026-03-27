@@ -4,6 +4,7 @@ import OpenID4VPProtocolHelper from './openid-4vp-protocol-helper.js';
 import MDOCProtocolHelper from './mdoc-protocol-helper.js';
 import OID4VPRedirectHelper from './oid4vp-redirect-helper.js';
 import { generateX509Hash, certToX5cChain } from './x509-helper.js';
+import { recheckCredentialStatus } from './status-list-helper.js';
 
 /**
  * Digital Credentials API Wrapper
@@ -219,13 +220,19 @@ export const processDirectPostResponse = async (options) => {
 
 /**
  * Verify mdoc credentials from an OID4VP redirect flow response.
- * @param {Object} options - See OID4VPRedirectHelper.verify
- * @param {string[]} [options.trustedCertificates] - Array of PEM-encoded trusted root/IACA certificates
+ * @param {Object} options
+ * @param {string[]} [options.trustedCertificates] - PEM-encoded trusted root/IACA certificates
+ * @param {boolean} [options.enableCrl=false] - Check CRL distribution points
+ * @param {number} [options.crlCacheTtlMs=3600000] - CRL cache TTL
+ * @param {boolean} [options.enableStatusList=false] - Check IETF Token Status List
+ * @param {number} [options.statusListCacheTtlMs=300000] - Status list cache TTL
  * @returns {Promise<Object>} { claims, valid, trusted, processedDocuments, sessionTranscript }
  */
 export const verifyRedirectResponse = async (options) => {
     return OID4VPRedirectHelper.verify(options);
 };
+
+export { recheckCredentialStatus };
 
 /**
  * Compute the JWK SHA-256 Thumbprint per RFC 7638.

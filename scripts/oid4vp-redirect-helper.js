@@ -208,7 +208,9 @@ class OID4VPRedirectHelper {
      * @param {string[]} [options.trustLists] - Trust list identifiers; defaults to ALL_TRUST_LISTS
      * @returns {Promise<{ claims, valid, trusted, processedDocuments, sessionTranscript }>}
      */
-    async verify({ vpToken, clientId, nonce, responseUri, encryptionJwk, mdocGeneratedNonce, trustLists = ALL_TRUST_LISTS, trustedCertificates }) {
+    async verify({ vpToken, clientId, nonce, responseUri, encryptionJwk, mdocGeneratedNonce,
+                   trustLists = ALL_TRUST_LISTS, trustedCertificates,
+                   enableCrl = false, crlCacheTtlMs, enableStatusList = false, statusListCacheTtlMs }) {
         let sessionTranscript;
 
         if (mdocGeneratedNonce) {
@@ -237,7 +239,9 @@ class OID4VPRedirectHelper {
             for (const token of tokens) {
                 const decoded = await decodeVpToken(token);
                 for (const doc of decoded.documents) {
-                    const { claims, issuer, valid: docValid, invalidReasons } = await verifyDocument(doc, sessionTranscript, { trustedCertificates });
+                    const { claims, issuer, valid: docValid, invalidReasons, statusListRef } = await verifyDocument(
+                        doc, sessionTranscript, { trustedCertificates, enableCrl, crlCacheTtlMs, enableStatusList, statusListCacheTtlMs }
+                    );
 
                     Object.assign(allClaims, claims);
 
@@ -252,7 +256,7 @@ class OID4VPRedirectHelper {
                         ));
                     if (!issuerTrusted) trusted = false;
 
-                    processedDocuments.push({ claims, issuer, valid: docValid, trusted: !!issuerTrusted, invalidReasons });
+                    processedDocuments.push({ claims, issuer, valid: docValid, trusted: !!issuerTrusted, invalidReasons, statusListRef });
                 }
             }
         }

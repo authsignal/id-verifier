@@ -1,5 +1,6 @@
 import * as asn1js from 'asn1js';
 import { parsePemCertificate } from './certificate-helper.js';
+import { checkCertRevocation } from './crl-helper.js';
 
 /**
  * Convert a DER-encoded ECDSA signature (SEQUENCE { INTEGER r, INTEGER s }) to
@@ -136,4 +137,23 @@ export const verifyIssuerTrust = async (certificate, { trustedCertificates } = {
     }
 
     return { trusted: false, matchedCertificate: null };
+};
+
+export const verifyIssuerTrustAndRevocation = async (certificate, options = {}) => {
+    const { enableCrl = false, crlCacheTtlMs = 3600000 } = options;
+
+    const trustResult = await verifyIssuerTrust(certificate, options);
+
+    let revoked = false;
+    let crlReason = null;
+    if (enableCrl && certificate) {
+        const crlResult = await checkCertRevocation(certificate, {
+            enabled: true,
+            cacheTtlMs: crlCacheTtlMs,
+        });
+        revoked = crlResult.revoked;
+        crlReason = crlResult.reason;
+    }
+
+    return { ...trustResult, revoked, crlReason };
 };
