@@ -205,21 +205,34 @@ const DEFAULT_CLAIMS = {
 // Route handlers
 // ---------------------------------------------------------------------------
 async function handleIndex(req, res) {
+    const url = new URL(req.url, BASE_URL);
+    const mode = url.searchParams.get('mode') || 'iso18013';
+
     const session = createSession();
     session.encJwk = await generateJWK();
+    session.mode = mode;
 
     const requestUri = `${BASE_URL}/request/${session.id}`;
-
-    // Use the hostname from BASE_URL as client_id with x509_san_dns scheme
-    // This matches the format MATTR wallet expects (ISO 18013-7 style)
     const baseHost = new URL(BASE_URL).hostname;
 
-    const authUrl = createAuthorizationRequestUrl({
-        clientId: baseHost,
-        clientIdScheme: 'x509_san_dns',
-        requestUri,
-        walletScheme: WALLET_SCHEME,
-    });
+    let authUrl;
+    if (mode === 'oid4vp') {
+        // OID4VP 1.0 — x509_hash prefix in client_id, openid4vp:// scheme, DCQL
+        authUrl = createAuthorizationRequestUrl({
+            clientId: `x509_hash:${readerAuth.clientId.split(':')[1]}`,
+            requestUri,
+            walletScheme: 'openid4vp://',
+            requestUriMethod: 'post',
+        });
+    } else {
+        // ISO 18013-7 — x509_san_dns as separate param, mdoc-openid4vp:// scheme, PEX
+        authUrl = createAuthorizationRequestUrl({
+            clientId: baseHost,
+            clientIdScheme: 'x509_san_dns',
+            requestUri,
+            walletScheme: WALLET_SCHEME,
+        });
+    }
 
     const qrSvg = await QRCode.toString(authUrl, { type: 'svg', width: 300, margin: 2, color: { dark: '#1a1a2e' } });
 
@@ -251,14 +264,22 @@ async function handleIndex(req, res) {
 <body>
     <h1>OID4VP Redirect Flow Test</h1>
 
+    <div class="card" style="text-align:center">
+        <div style="display:inline-flex;border-radius:8px;overflow:hidden;border:2px solid #1a1a2e">
+            <a href="/?mode=iso18013" style="padding:10px 20px;text-decoration:none;font-weight:600;font-size:14px;${mode === 'iso18013' ? 'background:#1a1a2e;color:white' : 'background:white;color:#1a1a2e'}">ISO 18013-7 / PEX</a>
+            <a href="/?mode=oid4vp" style="padding:10px 20px;text-decoration:none;font-weight:600;font-size:14px;${mode === 'oid4vp' ? 'background:#1a1a2e;color:white' : 'background:white;color:#1a1a2e'}">OID4VP 1.0 / DCQL</a>
+        </div>
+    </div>
+
     <div class="card">
-        <h2>Scan with MATTR Wallet</h2>
+        <h2>Scan with Wallet</h2>
         <div class="qr-container">
             ${qrSvg}
         </div>
         <div class="info">
             <strong>Session:</strong> ${session.id}<br>
-            <strong>Scheme:</strong> <span class="badge">${WALLET_SCHEME}</span>
+            <strong>Mode:</strong> <span class="badge">${mode === 'oid4vp' ? 'OID4VP 1.0 / DCQL' : 'ISO 18013-7 / PEX'}</span>
+            <strong>Scheme:</strong> <span class="badge">${mode === 'oid4vp' ? 'openid4vp://' : WALLET_SCHEME}</span>
             <strong>DocType:</strong> <span class="badge">${DOC_TYPE}</span>
         </div>
         <a href="${authUrl}" style="display:block;text-align:center;margin:16px 0;padding:14px 24px;background:#1a1a2e;color:white;border-radius:8px;text-decoration:none;font-weight:600;font-size:16px;">Open in Wallet</a>
@@ -373,27 +394,46 @@ async function handleRequestUri(req, res, sessionId) {
     const claims = DEFAULT_CLAIMS[DOC_TYPE] || DEFAULT_CLAIMS['org.iso.18013.5.1.mDL'];
 
     const baseHost = new URL(BASE_URL).hostname;
-
-    // Get public part of encryption JWK for client_metadata
     const { d, dp, dq, qi, ...encPublicJwk } = session.encJwk;
 
-    const jwt = await createRequestObject({
-        clientId: baseHost,
-        clientIdScheme: 'x509_san_dns',
-        nonce: session.nonce,
-        state: session.state,
-        responseUri: `${BASE_URL}/response`,
-        documentTypes: [DOC_TYPE],
-        claims,
-        privateKey: readerAuth.signingKey,
-        x5cChain: readerAuth.x5cChain,
-        walletNonce,
-        responseMode: 'direct_post.jwt',
-        usePresentationExchange: true,
-        encryptionJwk: encPublicJwk,
-        typ: null,
-        kid: readerAuth.kid,
-    });
+    let jwt;
+    if (session.mode === 'oid4vp') {
+        // OID4VP 1.0 — x509_hash client_id, DCQL, oauth-authz-req+jwt typ
+        jwt = await createRequestObject({
+            clientId: `x509_hash:${readerAuth.clientId.split(':')[1]}`,
+            nonce: session.nonce,
+            state: session.state,
+            responseUri: `${BASE_URL}/response`,
+            documentTypes: [DOC_TYPE],
+            claims,
+            privateKey: readerAuth.signingKey,
+            x5cChain: readerAuth.x5cChain,
+            walletNonce,
+            responseMode: 'direct_post.jwt',
+            usePresentationExchange: false,
+            encryptionJwk: encPublicJwk,
+            kid: readerAuth.kid,
+        });
+    } else {
+        // ISO 18013-7 — x509_san_dns, PEX, no typ
+        jwt = await createRequestObject({
+            clientId: baseHost,
+            clientIdScheme: 'x509_san_dns',
+            nonce: session.nonce,
+            state: session.state,
+            responseUri: `${BASE_URL}/response`,
+            documentTypes: [DOC_TYPE],
+            claims,
+            privateKey: readerAuth.signingKey,
+            x5cChain: readerAuth.x5cChain,
+            walletNonce,
+            responseMode: 'direct_post.jwt',
+            usePresentationExchange: true,
+            encryptionJwk: encPublicJwk,
+            typ: null,
+            kid: readerAuth.kid,
+        });
+    }
 
     console.log('\n--- Serving request object ---');
     console.log('Session:', sessionId);
@@ -516,9 +556,13 @@ async function handleResponseUri(req, res) {
 
         // Verify the credentials
         const baseHost = new URL(BASE_URL).hostname;
+        const verifyClientId = session.mode === 'oid4vp'
+            ? `x509_hash:${readerAuth.clientId.split(':')[1]}`
+            : baseHost;
+
         const result = await verifyRedirectResponse({
             vpToken: vpTokenObj,
-            clientId: baseHost,
+            clientId: verifyClientId,
             nonce: session.nonce,
             responseUri: `${BASE_URL}/response`,
             mdocGeneratedNonce: session.mdocGeneratedNonce,
