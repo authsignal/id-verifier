@@ -60,7 +60,7 @@ export const verifyDocument = async (document, sessionTranscript, verificationOp
     }
 
     // Check Token Status List if present in MSO and enabled
-    // Support both standard 'status' (RFC 9597) and vendor-prefixed '_status' (MATTR)
+    // Support both standard 'status' (RFC 9597) and vendor-prefixed '_status'
     const msoStatusInfo = issuerAuthPayload.status || issuerAuthPayload._status;
     if (msoStatusInfo && verificationOptions.enableStatusList) {
         const statusList = msoStatusInfo.statusList || msoStatusInfo.status_list;

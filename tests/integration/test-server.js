@@ -183,7 +183,7 @@ async function generateReaderKeyAndCert() {
     // Two-cert chain for OID4VP 1.0 wallets that verify the chain (Multipaz)
     const x5cChainFull = [readerCertBase64, caCertBase64];
 
-    // Also generate a single self-signed cert for ISO 18013-7 wallets (MATTR)
+    // Also generate a single self-signed cert for ISO 18013-7 wallets (ISO 18013-7)
     // that were working with single certs before
     const singleCertKeyPath = path.join(CERT_DIR, 'single-key.pem');
     const singleCertPath = path.join(CERT_DIR, 'single-cert.pem');
@@ -225,7 +225,7 @@ async function generateReaderKeyAndCert() {
 
     return {
         clientId, signingKey, x5cChain: x5cChainFull, publicKeyJwk, kid,
-        // ISO 18013-7 mode uses single self-signed cert (MATTR compatible)
+        // ISO 18013-7 mode uses single self-signed cert (ISO 18013-7 compatible)
         iso: {
             clientId: `x509_hash:${singleHash}`,
             signingKey: singleSigningKey,

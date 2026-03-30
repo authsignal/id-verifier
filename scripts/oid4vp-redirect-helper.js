@@ -32,7 +32,7 @@ class OID4VPRedirectHelper {
 
     /**
      * Generates a SessionTranscript for ISO 18013-7 Annex B / OID4VP 1.0 Appendix B.3.4.1.
-     * Used with Presentation Exchange-based wallets (MATTR, EUDI, etc.).
+     * Used with Presentation Exchange-based wallets (ISO 18013-7 compatible, EUDI, etc.).
      *
      * SessionTranscript = [null, null, OID4VPHandover]
      * OID4VPHandover = [clientIdHash, responseUriHash, nonce]
@@ -360,7 +360,7 @@ class OID4VPRedirectHelper {
 
     /**
      * Build a Presentation Exchange presentation_definition for ISO 18013-7 / OID4VP draft 18.
-     * This is the legacy format that older wallets (MATTR, etc.) expect.
+     * This is the legacy format that older wallets (ISO 18013-7 compatible, etc.) expect.
      *
      * @param {string[]} documentTypes
      * @param {Array<[string, string]>} claims - [namespace, element] pairs
