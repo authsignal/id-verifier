@@ -136,6 +136,8 @@ dist
 .pnp.*
 
 ssl/*
+tests/integration/.certs/
 
 .DS_Store
 playground/
+tests/integration/.srl

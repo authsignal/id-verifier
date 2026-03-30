@@ -19,6 +19,21 @@ export const parseX5Chain = (x5chain) => {
 };
 
 /**
+ * Parse all certificates from a X.509 chain into an array of PKIjs Certificate objects
+ * @param {Array|Uint8Array} x5chain - The X.509 chain (array of DER-encoded certs or a single cert)
+ * @returns {Certificate[]} - Array of parsed Certificate objects
+ */
+export const parseX5ChainAll = (x5chain) => {
+    if (!x5chain) return [];
+    const certs = x5chain instanceof Array ? x5chain : [x5chain];
+    return certs.map(certBytes => {
+        const arrayBuffer = certBytes.buffer.slice(certBytes.byteOffset, certBytes.byteOffset + certBytes.byteLength);
+        const asn1 = asn1js.fromBER(arrayBuffer);
+        return new Certificate({ schema: asn1.result });
+    });
+};
+
+/**
  * Get the AuthorityKeyIdentifier from a X.509 certificate
  * @param {Certificate} x509Cert - The X.509 certificate
  * @returns {string} - The AuthorityKeyIdentifier in base64url format
@@ -146,4 +161,43 @@ export const validateCertificateAgainstIssuer = async (certificate, issuerCertif
     }
 
     return null;
+};
+
+// OID to name mapping for common X.509 distinguished name attributes
+const DN_OID_MAP = {
+    '2.5.4.3': 'commonName',
+    '2.5.4.6': 'country',
+    '2.5.4.7': 'locality',
+    '2.5.4.8': 'state',
+    '2.5.4.10': 'organization',
+    '2.5.4.11': 'organizationalUnit',
+    '2.5.4.5': 'serialNumber',
+};
+
+/**
+ * Extract readable metadata from a PKIjs Certificate
+ * @param {Certificate} x509Cert - The X.509 certificate
+ * @returns {Object} Certificate info: subject, issuer, validity, serialNumber
+ */
+export const getCertificateInfo = (x509Cert) => {
+    if (!x509Cert) return null;
+
+    const extractDN = (rdnSequence) => {
+        const dn = {};
+        if (!rdnSequence?.typesAndValues) return dn;
+        for (const attr of rdnSequence.typesAndValues) {
+            const name = DN_OID_MAP[attr.type] || attr.type;
+            dn[name] = attr.value.valueBlock.value;
+        }
+        return dn;
+    };
+
+    return {
+        subject: extractDN(x509Cert.subject),
+        issuer: extractDN(x509Cert.issuer),
+        serialNumber: Array.from(new Uint8Array(x509Cert.serialNumber.valueBlock.valueHex))
+            .map(b => b.toString(16).padStart(2, '0')).join(':'),
+        notBefore: x509Cert.notBefore.value?.toISOString(),
+        notAfter: x509Cert.notAfter.value?.toISOString(),
+    };
 };

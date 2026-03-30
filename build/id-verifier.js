@@ -2,7 +2,9 @@ import TrustedIssuerRegistry, { verifySignatureWithPem } from 'trusted-issuer-re
 import * as asn1js from 'asn1js';
 import { Certificate } from 'pkijs';
 import * as cbor2 from 'cbor2';
+import pako from 'pako';
 import { CipherSuite, Aes128Gcm, HkdfSha256, DhkemP256HkdfSha256 } from '@hpke/core';
+import { SignJWT, importJWK, compactDecrypt } from 'jose';
 
 /**
  * Supported trust lists
@@ -41,6 +43,32 @@ const CredentialFormat = {
 const ProtocolFormats = {
     [Protocol.OPENID4VP]: [CredentialFormat.MSO_MDOC],//CredentialFormat.DC_SD_JWT, CredentialFormat.LDP_VC, CredentialFormat.JWT_VC_JSON],
     [Protocol.MDOC]: [CredentialFormat.MSO_MDOC]
+};
+
+/**
+ * OID4VP Response Modes
+ */
+const ResponseMode = {
+    DC_API: 'dc_api',
+    DIRECT_POST: 'direct_post',
+    DIRECT_POST_JWT: 'direct_post.jwt',
+};
+
+/**
+ * OID4VP Client Identifier Prefixes
+ */
+const ClientIdPrefix = {
+    X509_HASH: 'x509_hash',
+    X509_SAN_DNS: 'x509_san_dns',
+    REDIRECT_URI: 'redirect_uri',
+};
+
+/**
+ * Default wallet URL schemes for OID4VP authorization requests
+ */
+const WalletScheme = {
+    OPENID4VP: 'openid4vp://',
+    MDOC_OPENID4VP: 'mdoc-openid4vp://',
 };
 
 const createCredentialId = (format, documentType) => {
@@ -394,6 +422,24 @@ const x509ToWebCryptoKey = async (x509Cert, coseAlg) => {
 };
 
 /**
+ * Parse a PEM certificate string into a PKIjs Certificate object
+ * @param {string} pemString - The PEM certificate string
+ * @returns {Certificate} - The parsed Certificate object
+ */
+const parsePemCertificate = (pemString) => {
+    const pemContent = pemString
+        .replace(/-----BEGIN CERTIFICATE-----/, '')
+        .replace(/-----END CERTIFICATE-----/, '')
+        .replace(/\s/g, '');
+
+    const bytes = base64ToUint8Array(pemContent);
+
+    const asn1 = asn1js.fromBER(bytes.buffer);
+    const cert = new Certificate({ schema: asn1.result });
+    return cert;
+};
+
+/**
  * Validate a certificate against a list of issuer certificates in PEM format
  * @param {Certificate} certificate - The certificate to validate
  * @param {Array} issuerCertificates - The list of issuer certificates in PEM format
@@ -429,6 +475,45 @@ const validateCertificateAgainstIssuer = async (certificate, issuerCertificates)
     }
 
     return null;
+};
+
+// OID to name mapping for common X.509 distinguished name attributes
+const DN_OID_MAP = {
+    '2.5.4.3': 'commonName',
+    '2.5.4.6': 'country',
+    '2.5.4.7': 'locality',
+    '2.5.4.8': 'state',
+    '2.5.4.10': 'organization',
+    '2.5.4.11': 'organizationalUnit',
+    '2.5.4.5': 'serialNumber',
+};
+
+/**
+ * Extract readable metadata from a PKIjs Certificate
+ * @param {Certificate} x509Cert - The X.509 certificate
+ * @returns {Object} Certificate info: subject, issuer, validity, serialNumber
+ */
+const getCertificateInfo = (x509Cert) => {
+    if (!x509Cert) return null;
+
+    const extractDN = (rdnSequence) => {
+        const dn = {};
+        if (!rdnSequence?.typesAndValues) return dn;
+        for (const attr of rdnSequence.typesAndValues) {
+            const name = DN_OID_MAP[attr.type] || attr.type;
+            dn[name] = attr.value.valueBlock.value;
+        }
+        return dn;
+    };
+
+    return {
+        subject: extractDN(x509Cert.subject),
+        issuer: extractDN(x509Cert.issuer),
+        serialNumber: Array.from(new Uint8Array(x509Cert.serialNumber.valueBlock.valueHex))
+            .map(b => b.toString(16).padStart(2, '0')).join(':'),
+        notBefore: x509Cert.notBefore.value?.toISOString(),
+        notAfter: x509Cert.notAfter.value?.toISOString(),
+    };
 };
 
 let registry = new TrustedIssuerRegistry();
@@ -493,6 +578,505 @@ function logEndOfLifeWarning() {
         console.warn(`trusted-issuer-registry minor version ${TrustedIssuerRegistry.minorVersion} reaching end of life on ${endOfLifeDate.toISOString().split('T')[0]}, please update to the latest major/minor version before then to avoid outdated issuer information`);
     }
     priorWarning = Date.now();
+}
+
+class FetchCache {
+    constructor({ fetchFn }) {
+        this._fetchFn = fetchFn;
+        this._cache = new Map();
+    }
+
+    async get(url, { ttlMs }) {
+        const entry = this._cache.get(url);
+        if (entry && (Date.now() - entry.timestamp) < ttlMs) {
+            return entry.value;
+        }
+        try {
+            const value = await this._fetchFn(url);
+            this._cache.set(url, { value, timestamp: Date.now() });
+            return value;
+        } catch (err) {
+            console.error(`FetchCache: error fetching ${url}:`, err);
+            return null;
+        }
+    }
+
+    clear() {
+        this._cache.clear();
+    }
+
+    invalidate(url) {
+        this._cache.delete(url);
+    }
+}
+
+const crlCache = new FetchCache({
+    fetchFn: async (url) => {
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch CRL from ${url}: ${response.status} ${response.statusText}`);
+        }
+        return await response.arrayBuffer();
+    },
+});
+
+/**
+ * Recursively extract URIs from an ASN.1 node tree.
+ * Looks for context-tagged [6] nodes (uniformResourceIdentifier in GeneralName).
+ * @param {object} node - ASN.1 node
+ * @param {string[]} urls - array to push found URLs into
+ */
+function extractUrisFromAsn1(node, urls) {
+    if (
+        node.idBlock.tagClass === 3 &&
+        node.idBlock.tagNumber === 6 &&
+        node.valueBlock.valueHex
+    ) {
+        const uri = new TextDecoder('utf-8').decode(node.valueBlock.valueHex);
+        if (uri.startsWith('http')) {
+            urls.push(uri);
+        }
+    }
+
+    const children = node.valueBlock?.value;
+    if (Array.isArray(children)) {
+        for (const child of children) {
+            extractUrisFromAsn1(child, urls);
+        }
+    }
+}
+
+/**
+ * Extract CRL Distribution Point URLs from a pkijs Certificate.
+ * @param {object} certificate - pkijs Certificate object
+ * @returns {string[]} array of HTTP(S) CRL URLs
+ */
+function getCrlDistributionPoints(certificate) {
+    const extensions = certificate.extensions;
+    if (!extensions) return [];
+
+    const crlDpExt = extensions.find(ext => ext.extnID === '2.5.29.31');
+    if (!crlDpExt) return [];
+
+    const derBytes = crlDpExt.extnValue.valueBlock?.valueHex ?? crlDpExt.extnValue;
+    const parsed = asn1js.fromBER(derBytes instanceof ArrayBuffer ? derBytes : derBytes.buffer ?? derBytes);
+    if (parsed.offset === -1) return [];
+
+    const urls = [];
+    extractUrisFromAsn1(parsed.result, urls);
+    return urls;
+}
+
+/**
+ * Parse a DER-encoded CRL and extract revoked serial numbers.
+ * @param {ArrayBuffer} derBytes
+ * @returns {{ revokedSerials: Set<string> }}
+ */
+function parseCrl(derBytes) {
+    const parsed = asn1js.fromBER(derBytes);
+    if (parsed.offset === -1) {
+        return { revokedSerials: new Set() };
+    }
+
+    const revokedSerials = new Set();
+
+    try {
+        // CRL structure: SEQUENCE { tbsCertList SEQUENCE { version, signature, issuer, thisUpdate, nextUpdate, revokedCertificates SEQUENCE OF { SEQUENCE { serialNumber INTEGER, ... } } } }
+        const crlSequence = parsed.result;
+        const tbsCertList = crlSequence.valueBlock.value[0]; // first element of outer SEQUENCE is tbsCertList
+        const tbsChildren = tbsCertList.valueBlock.value;
+
+        // Find revokedCertificates — it's a SEQUENCE OF, and comes after the mandatory fields.
+        // Mandatory: version(optional), signature, issuer, thisUpdate, nextUpdate
+        // We look for a SEQUENCE whose first child is a SEQUENCE (revokedCertEntry)
+        for (const child of tbsChildren) {
+            if (
+                child.idBlock.tagClass === 1 &&
+                child.idBlock.tagNumber === 16 // SEQUENCE
+            ) {
+                const innerChildren = child.valueBlock.value;
+                if (
+                    innerChildren &&
+                    innerChildren.length > 0 &&
+                    innerChildren[0].idBlock?.tagClass === 1 &&
+                    innerChildren[0].idBlock?.tagNumber === 16
+                ) {
+                    // This looks like revokedCertificates SEQUENCE OF SEQUENCE
+                    for (const entry of innerChildren) {
+                        const entryChildren = entry.valueBlock?.value;
+                        if (entryChildren && entryChildren.length > 0) {
+                            const serialNode = entryChildren[0];
+                            if (serialNode.valueBlock?.valueHex) {
+                                const hexStr = Buffer.from(serialNode.valueBlock.valueHex).toString('hex');
+                                revokedSerials.add(hexStr);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    } catch (err) {
+        // If parsing fails, return empty set (safe default)
+    }
+
+    return { revokedSerials };
+}
+
+/**
+ * Get the serial number of a pkijs Certificate as a hex string.
+ * @param {object} certificate - pkijs Certificate object
+ * @returns {string}
+ */
+function getSerialNumberHex(certificate) {
+    return Buffer.from(certificate.serialNumber.valueBlock.valueHex).toString('hex');
+}
+
+/**
+ * Check whether a certificate has been revoked via CRL.
+ * @param {object} certificate - pkijs Certificate object
+ * @param {object} options
+ * @param {boolean} [options.enabled=true] - if false, skip revocation check
+ * @param {number} [options.cacheTtlMs=3600000] - CRL cache TTL in milliseconds
+ * @returns {Promise<{ revoked: boolean, reason?: string }>}
+ */
+async function checkCertRevocation(certificate, options = {}) {
+    const { enabled = true, cacheTtlMs = 3600000 } = options;
+
+    if (!enabled) {
+        return { revoked: false };
+    }
+
+    const crlUrls = getCrlDistributionPoints(certificate);
+    if (crlUrls.length === 0) {
+        return { revoked: false };
+    }
+
+    const serialHex = getSerialNumberHex(certificate);
+
+    for (const url of crlUrls) {
+        const derBytes = await crlCache.get(url, { ttlMs: cacheTtlMs });
+        if (!derBytes) continue;
+
+        const { revokedSerials } = parseCrl(derBytes);
+        if (revokedSerials.has(serialHex)) {
+            return { revoked: true, reason: `Certificate serial ${serialHex} found in CRL at ${url}` };
+        }
+    }
+
+    return { revoked: false };
+}
+
+/**
+ * Convert a DER-encoded ECDSA signature (SEQUENCE { INTEGER r, INTEGER s }) to
+ * the raw r||s format expected by Web Crypto.
+ *
+ * @param {ArrayBuffer} derSig - DER-encoded ECDSA signature bytes
+ * @param {string} curve - 'P-256' or 'P-384'
+ * @returns {Uint8Array} - Raw r||s signature bytes
+ */
+const derEcdsaSignatureToRaw = (derSig, curve) => {
+    const componentLength = curve === 'P-384' ? 48 : 32;
+
+    // Parse the outer SEQUENCE
+    const asn1 = asn1js.fromBER(derSig);
+    const sequence = asn1.result;
+    const [rInteger, sInteger] = sequence.valueBlock.value;
+
+    const extractInteger = (integerBlock) => {
+        // valueBlock.valueHex is an ArrayBuffer
+        let bytes = new Uint8Array(integerBlock.valueBlock.valueHex);
+        // Strip leading zero byte(s) that DER adds to indicate positive sign
+        let start = 0;
+        while (start < bytes.length - 1 && bytes[start] === 0x00) {
+            start++;
+        }
+        bytes = bytes.slice(start);
+        // Pad to component length
+        const padded = new Uint8Array(componentLength);
+        padded.set(bytes, componentLength - bytes.length);
+        return padded;
+    };
+
+    const r = extractInteger(rInteger);
+    const s = extractInteger(sInteger);
+
+    const raw = new Uint8Array(componentLength * 2);
+    raw.set(r, 0);
+    raw.set(s, componentLength);
+    return raw;
+};
+
+/**
+ * Determine the Web Crypto algorithm parameters from an SPKI public key.
+ *
+ * @param {ArrayBuffer} spkiBytes - SPKI-encoded public key bytes
+ * @returns {{ name: string, namedCurve?: string, hash: string }} - Web Crypto algorithm params
+ */
+const algorithmFromSpki = (spkiBytes) => {
+    const asn1 = asn1js.fromBER(spkiBytes);
+    // SPKI structure: SEQUENCE { SEQUENCE { OID, params }, BIT STRING }
+    const algorithmSequence = asn1.result.valueBlock.value[0];
+    const oidBlock = algorithmSequence.valueBlock.value[0];
+    const oid = oidBlock.valueBlock.toString();
+
+    if (oid === '1.2.840.10045.2.1') {
+        // EC key — check curve OID from params
+        const curveOidBlock = algorithmSequence.valueBlock.value[1];
+        const curveOid = curveOidBlock.valueBlock.toString();
+        // P-256: 1.2.840.10045.3.1.7
+        // P-384: 1.3.132.0.34
+        const namedCurve = curveOid === '1.3.132.0.34' ? 'P-384' : 'P-256';
+        const hash = namedCurve === 'P-384' ? 'SHA-384' : 'SHA-256';
+        return { name: 'ECDSA', namedCurve, hash };
+    }
+
+    if (oid === '1.2.840.113549.1.1.1') {
+        // RSA key
+        return { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' };
+    }
+
+    throw new Error(`Unsupported public key algorithm OID: ${oid}`);
+};
+
+/**
+ * Verify whether a leaf certificate is signed by one of the provided trusted CA PEMs.
+ *
+ * @param {import('pkijs').Certificate} certificate - The issuer leaf cert (pkijs Certificate)
+ * @param {{ trustedCertificates?: string[] }} options
+ * @returns {Promise<{ trusted: boolean, matchedCertificate: string|null }>}
+ */
+const verifyIssuerTrust = async (certificate, { trustedCertificates } = {}) => {
+    if (!trustedCertificates || trustedCertificates.length === 0) {
+        return { trusted: false, matchedCertificate: null };
+    }
+
+    // Extract TBS bytes and signature from the leaf cert
+    const tbsBytes = new Uint8Array(certificate.tbsView);
+    const signatureDer = certificate.signatureValue.valueBlock.valueHex;
+
+    for (const trustedPem of trustedCertificates) {
+        try {
+            const trustedCert = parsePemCertificate(trustedPem);
+
+            // Get SPKI bytes from the trusted (issuer) cert
+            const spkiBytes = trustedCert.subjectPublicKeyInfo.toSchema().toBER();
+
+            const algParams = algorithmFromSpki(spkiBytes);
+
+            let importAlgorithm, verifyAlgorithm, signatureBytes;
+
+            if (algParams.name === 'ECDSA') {
+                importAlgorithm = { name: 'ECDSA', namedCurve: algParams.namedCurve };
+                verifyAlgorithm = { name: 'ECDSA', hash: algParams.hash };
+                // Convert DER ECDSA signature to raw r||s
+                signatureBytes = derEcdsaSignatureToRaw(signatureDer, algParams.namedCurve);
+            } else {
+                importAlgorithm = { name: 'RSASSA-PKCS1-v1_5', hash: algParams.hash };
+                verifyAlgorithm = { name: 'RSASSA-PKCS1-v1_5' };
+                signatureBytes = new Uint8Array(signatureDer);
+            }
+
+            const publicKey = await crypto.subtle.importKey(
+                'spki',
+                spkiBytes,
+                importAlgorithm,
+                false,
+                ['verify']
+            );
+
+            const isValid = await crypto.subtle.verify(
+                verifyAlgorithm,
+                publicKey,
+                signatureBytes,
+                tbsBytes
+            );
+
+            if (isValid) {
+                return { trusted: true, matchedCertificate: trustedPem };
+            }
+        } catch {
+            // Try next trusted cert
+            continue;
+        }
+    }
+
+    return { trusted: false, matchedCertificate: null };
+};
+
+const verifyIssuerTrustAndRevocation = async (certificate, options = {}) => {
+    const { enableCrl = false, crlCacheTtlMs = 3600000 } = options;
+
+    const trustResult = await verifyIssuerTrust(certificate, options);
+
+    let revoked = false;
+    let crlReason = null;
+    if (enableCrl && certificate) {
+        const crlResult = await checkCertRevocation(certificate, {
+            enabled: true,
+            cacheTtlMs: crlCacheTtlMs,
+        });
+        revoked = crlResult.revoked;
+        crlReason = crlResult.reason;
+    }
+
+    return { ...trustResult, revoked, crlReason };
+};
+
+// CWT payload keys per Token Status List spec
+const CWT_STATUS_LIST_KEY = -65538; // status_list
+const CWT_STATUS_LIST_BITS = 'bits';
+const CWT_STATUS_LIST_LST = 'lst';
+
+// Cache for status list tokens (JWT or CWT), keyed by URI
+const statusListCache = new FetchCache({
+    fetchFn: async (url) => {
+        // Don't send restrictive Accept header — let the server decide format
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch status list from ${url}: ${response.status}`);
+        }
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('cwt') || contentType.includes('cbor') || contentType.includes('octet-stream')) {
+            // CWT format — return raw bytes + format indicator
+            const arrayBuffer = await response.arrayBuffer();
+            return { format: 'cwt', data: new Uint8Array(arrayBuffer) };
+        }
+        // JWT format — return text + format indicator
+        const text = await response.text();
+        // Check if it looks like a JWT (three dot-separated parts)
+        if (text.includes('.')) {
+            return { format: 'jwt', data: text };
+        }
+        // Might be binary CWT returned without proper content-type
+        return { format: 'cwt', data: new Uint8Array(await new Blob([text]).arrayBuffer()) };
+    },
+});
+
+/**
+ * Extract the status list (compressed bitstring + bits) from a JWT or CWT token.
+ * @param {{ format: string, data: any }} token - The fetched token
+ * @returns {{ lst: Uint8Array|string, bits: number }} The status list data
+ */
+function extractStatusList(token) {
+    if (token.format === 'jwt') {
+        // JWT: decode payload (base64url), extract status_list.lst and status_list.bits
+        const parts = token.data.split('.');
+        if (parts.length < 2) throw new Error('Invalid JWT format');
+        const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+        const statusList = payload?.status_list;
+        if (!statusList?.lst) throw new Error('JWT missing status_list.lst');
+        return { lst: statusList.lst, bits: statusList.bits || 1, isBase64url: true };
+    }
+
+    if (token.format === 'cwt') {
+        // CWT: COSE_Sign1 = Tag(18, [protectedHeaders, unprotectedHeaders, payload, signature])
+        const decoded = cbor2.decode(token.data);
+        const coseArray = decoded.contents || decoded;
+        const payloadRaw = coseArray[2]; // third element is the payload
+        const payload = cbor2.decode(payloadRaw);
+
+        // Payload is a CBOR Map with key -65538 for status_list
+        let statusList;
+        if (payload instanceof Map) {
+            statusList = payload.get(CWT_STATUS_LIST_KEY);
+        } else {
+            statusList = payload[CWT_STATUS_LIST_KEY] || payload.status_list;
+        }
+
+        if (!statusList) throw new Error('CWT missing status_list');
+
+        const lst = statusList instanceof Map ? statusList.get(CWT_STATUS_LIST_LST) : statusList[CWT_STATUS_LIST_LST] || statusList.lst;
+        const bits = statusList instanceof Map ? statusList.get(CWT_STATUS_LIST_BITS) : statusList[CWT_STATUS_LIST_BITS] || statusList.bits || 1;
+
+        if (!lst) throw new Error('CWT status_list missing lst');
+        return { lst, bits, isBase64url: false };
+    }
+
+    throw new Error(`Unknown token format: ${token.format}`);
+}
+
+/**
+ * Decodes a zlib-compressed bitstring and extracts the status value at the given index.
+ * RFC 9597 MSB-first bit ordering: index 0 is bit 7 of byte 0.
+ *
+ * @param {string|Uint8Array} compressedBitstring - base64url string or raw bytes
+ * @param {number} index - credential's position in the status list
+ * @param {number} bits - bits per entry (1 or 2, default 1)
+ * @param {boolean} [isBase64url=true] - whether the input is base64url-encoded
+ * @returns {number} numeric status value (0 = valid, non-zero = revoked/suspended)
+ */
+function getStatusFromBitstring(compressedBitstring, index, bits = 1, isBase64url = true) {
+    let compressed;
+    if (isBase64url && typeof compressedBitstring === 'string') {
+        compressed = Buffer.from(compressedBitstring, 'base64url');
+    } else if (compressedBitstring instanceof Uint8Array) {
+        compressed = compressedBitstring;
+    } else {
+        compressed = Buffer.from(compressedBitstring, 'base64url');
+    }
+    const bitstring = pako.inflate(compressed);
+
+    // RFC 9597 Section 4.1: bit position starts from the LEAST significant bit
+    const byteIndex = Math.floor((index * bits) / 8);
+    const bitPosition = (index * bits) % 8; // from LSB
+    const mask = ((1 << bits) - 1) << bitPosition;
+    return (bitstring[byteIndex] & mask) >> bitPosition;
+}
+
+/**
+ * Checks the revocation status of a credential using an IETF Token Status List.
+ * Supports both JWT and CWT (CBOR Web Token) formats.
+ *
+ * @param {{ uri: string, index: number }} statusListRef
+ * @param {object} [options]
+ * @param {boolean} [options.enabled=true]
+ * @param {number} [options.cacheTtlMs=300000]
+ * @param {number} [options.bits=1]
+ * @returns {Promise<{ revoked: boolean, status?: number, statusListRef: object }>}
+ */
+async function checkTokenStatusList(statusListRef, options = {}) {
+    const { enabled = true, cacheTtlMs = 300000, bits = 1 } = options;
+
+    if (!enabled) {
+        return { revoked: false, statusListRef };
+    }
+
+    const token = await statusListCache.get(statusListRef.uri, { ttlMs: cacheTtlMs });
+    if (!token) {
+        console.error(`Failed to fetch status list from ${statusListRef.uri}`);
+        return { revoked: false, statusListRef };
+    }
+
+    const { lst, bits: tokenBits, isBase64url } = extractStatusList(token);
+    const effectiveBits = tokenBits || bits;
+
+    const status = getStatusFromBitstring(lst, statusListRef.index, effectiveBits, isBase64url);
+    const revoked = status !== 0;
+
+    return { revoked, status, statusListRef };
+}
+
+/**
+ * Re-checks credential status, bypassing cache by default.
+ *
+ * @param {{ uri: string, index: number }} statusListRef
+ * @param {object} [options]
+ * @param {number} [options.cacheTtlMs=0]
+ * @param {number} [options.bits=1]
+ * @returns {Promise<{ revoked: boolean, status: number, checkedAt: string, statusListRef: object }>}
+ */
+async function recheckCredentialStatus(statusListRef, options = {}) {
+    const { cacheTtlMs = 0, bits = 1 } = options;
+    const result = await checkTokenStatusList(statusListRef, {
+        enabled: true,
+        cacheTtlMs,
+        bits,
+    });
+    return {
+        ...result,
+        checkedAt: new Date().toISOString(),
+    };
 }
 
 const verifyCoseSign1 = async (coseKey, publicKey) => {
@@ -581,7 +1165,7 @@ const decodeVpToken = async (vp_token) => {
     return decoded;
 };
 
-const verifyDocument = async (document, sessionTranscript) => {
+const verifyDocument = async (document, sessionTranscript, verificationOptions = {}) => {
     const claims = {};
     const invalidReasons = [];
     const { docType, issuerSigned, deviceSigned } = document;
@@ -600,12 +1184,67 @@ const verifyDocument = async (document, sessionTranscript) => {
             }
         }
     }
-    const issuer = await getIssuer(certificate);
+    // Determine issuer trust and CRL revocation
+    let issuerTrusted = false;
+    let issuerRevoked = false;
+    let issuer = null;
+    let statusListRef = null;
+    let credentialRevoked = false;
+
+    if (verificationOptions.trustedCertificates) {
+        const trustResult = await verifyIssuerTrustAndRevocation(certificate, {
+            trustedCertificates: verificationOptions.trustedCertificates,
+            enableCrl: verificationOptions.enableCrl,
+            crlCacheTtlMs: verificationOptions.crlCacheTtlMs,
+        });
+        issuerTrusted = trustResult.trusted;
+        issuerRevoked = trustResult.revoked;
+        if (trustResult.trusted) {
+            issuer = {
+                certificateInfo: getCertificateInfo(certificate),
+                certificate: { data: trustResult.matchedCertificate, format: 'pem' },
+            };
+        }
+    } else {
+        // Fall back to trusted-issuer-registry
+        issuer = await getIssuer(certificate);
+        issuerTrusted = !!issuer;
+    }
+
+    // Check Token Status List if present in MSO and enabled
+    // Support both standard 'status' (RFC 9597) and vendor-prefixed '_status' (MATTR)
+    const msoStatusInfo = issuerAuthPayload.status || issuerAuthPayload._status;
+    if (msoStatusInfo && verificationOptions.enableStatusList) {
+        const statusList = msoStatusInfo.statusList || msoStatusInfo.status_list;
+        if (statusList) {
+            statusListRef = {
+                uri: statusList.uri,
+                index: statusList.idx ?? statusList.index,
+            };
+            const statusResult = await checkTokenStatusList(statusListRef, {
+                enabled: true,
+                cacheTtlMs: verificationOptions.statusListCacheTtlMs,
+            });
+            credentialRevoked = statusResult.revoked;
+        }
+    }
+
+    const credentialVerified = valid && deviceValid && claimsValid;
+
     return {
-        claims: claims,
-        issuer: issuer,
-        valid: valid && deviceValid && claimsValid,
-        invalidReasons: invalidReasons,
+        claims,
+        issuer,
+        valid: credentialVerified && issuerTrusted && !issuerRevoked && !credentialRevoked,
+        credentialVerified,
+        issuerTrusted,
+        issuerRevoked,
+        credentialRevoked,
+        statusListRef,
+        invalidReasons: [
+            ...invalidReasons,
+            ...(issuerRevoked ? ['Issuer certificate revoked via CRL'] : []),
+            ...(credentialRevoked ? ['Credential revoked via status list'] : []),
+        ],
     };
 };
 
@@ -621,16 +1260,18 @@ async function verifyIssuerAuth(issuerAuth) {
     } else if(new Date(issuerAuthPayload.validityInfo.validUntil) < now) {
         invalidReason = 'MSO is expired';
     }
+    // Always extract the certificate for issuer info, even if MSO validity failed
+    const coseAlg = protectedHeaders.get(1);
+    //https://datatracker.ietf.org/doc/rfc9360/
+    const x5bag = unprotectedHeaders.get(32);
+    const x5chain = unprotectedHeaders.get(33);
+    unprotectedHeaders.get(34);
+    unprotectedHeaders.get(35);
+    if(x5bag) ; else if(x5chain) {
+        certificate = parseX5Chain(x5chain);
+    } else ;
+
     if(!invalidReason) {
-        const coseAlg = protectedHeaders.get(1);
-        //https://datatracker.ietf.org/doc/rfc9360/
-        const x5bag = unprotectedHeaders.get(32);
-        const x5chain = unprotectedHeaders.get(33);
-        unprotectedHeaders.get(34);
-        unprotectedHeaders.get(35);
-        if(x5bag) ; else if(x5chain) {
-            certificate = parseX5Chain(x5chain);
-        } else ;
         if(certificate) {
             const publicKey = await x509ToWebCryptoKey(certificate, coseAlg);
             const signatureValid = await verifyCoseSign1(issuerAuth, publicKey);
@@ -1089,6 +1730,449 @@ class MDOCProtocolHelper {
 const mdocProtocolHelper = new MDOCProtocolHelper();
 
 /**
+ * Signs an OID4VP request object as a JWT.
+ * @param {Object} payload - Claims to include (client_id, nonce, response_uri, dcql_query, etc.)
+ * @param {import('jose').KeyLike} privateKey - jose KeyLike signing key
+ * @param {string[]} x5cChain - Array of base64-encoded DER certificates for the x5c JOSE header
+ * @param {string} alg - Signing algorithm (default: 'ES256')
+ * @returns {Promise<string>} Signed JWT
+ */
+async function signRequestObject(payload, privateKey, x5cChain, alg = 'ES256', { typ, kid, includeIat = true } = {}) {
+    const header = { alg, x5c: x5cChain };
+    if (typ) header.typ = typ;
+    if (kid) header.kid = kid;
+    const builder = new SignJWT(payload).setProtectedHeader(header);
+    if (includeIat) builder.setIssuedAt();
+    return builder.sign(privateKey);
+}
+
+/**
+ * Decrypts a JWE response from a wallet's direct_post.jwt submission.
+ * @param {string} jwe - Compact JWE string
+ * @param {Object} recipientJwk - Verifier's ephemeral private JWK (with `d` parameter)
+ * @returns {Promise<Object>} Parsed JSON payload
+ */
+async function decryptJweResponse(jwe, recipientJwk) {
+    const privateKey = await importJWK(recipientJwk, 'ECDH-ES');
+    const { plaintext } = await compactDecrypt(jwe, privateKey);
+    return JSON.parse(new TextDecoder().decode(plaintext));
+}
+
+class OID4VPRedirectHelper {
+    /**
+     * Generates a SessionTranscript for OID4VP 1.0 redirect flows (Appendix B.2.6.1).
+     * Used with DCQL-based wallets.
+     *
+     * SessionTranscript = [null, null, ["OpenID4VPHandover", SHA256(CBOR([clientId, nonce, jwkThumbprint, responseUri]))]]
+     *
+     * @param {string} clientId
+     * @param {string} nonce
+     * @param {Uint8Array|null} jwkThumbprint
+     * @param {string} responseUri
+     * @returns {Promise<Uint8Array>} CBOR-encoded SessionTranscript
+     */
+    async _generateSessionTranscript(clientId, nonce, jwkThumbprint, responseUri) {
+        if (!clientId) throw new Error('clientId is required for generating session transcript');
+        if (!nonce) throw new Error('nonce is required for generating session transcript');
+        if (!responseUri) throw new Error('responseUri is required for generating session transcript');
+
+        const handoverInfo = [clientId, nonce, jwkThumbprint, responseUri];
+        const handoverInfoBytes = cbor2.encode(handoverInfo);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', handoverInfoBytes);
+        const hashArray = new Uint8Array(hashBuffer);
+
+        const handover = ['OpenID4VPHandover', hashArray];
+        return cbor2.encode([null, null, handover]);
+    }
+
+    /**
+     * Generates a SessionTranscript for ISO 18013-7 Annex B / OID4VP 1.0 Appendix B.3.4.1.
+     * Used with Presentation Exchange-based wallets (MATTR, EUDI, etc.).
+     *
+     * SessionTranscript = [null, null, OID4VPHandover]
+     * OID4VPHandover = [clientIdHash, responseUriHash, nonce]
+     * clientIdHash    = SHA-256(CBOR([clientId, mdocGeneratedNonce]))
+     * responseUriHash = SHA-256(CBOR([responseUri, mdocGeneratedNonce]))
+     *
+     * @param {string} clientId - client_id from the Authorization Request
+     * @param {string} responseUri - response_uri from the Authorization Request
+     * @param {string} nonce - nonce from the Authorization Request
+     * @param {string} mdocGeneratedNonce - wallet-generated nonce from JWE apu header
+     * @returns {Promise<Uint8Array>} CBOR-encoded SessionTranscript
+     */
+    async _generateISO18013SessionTranscript(clientId, responseUri, nonce, mdocGeneratedNonce) {
+        if (!clientId) throw new Error('clientId is required');
+        if (!responseUri) throw new Error('responseUri is required');
+        if (!nonce) throw new Error('nonce is required');
+        if (!mdocGeneratedNonce) throw new Error('mdocGeneratedNonce is required');
+
+        // clientIdHash = SHA-256(CBOR([clientId, mdocGeneratedNonce]))
+        const clientIdToHash = cbor2.encode([clientId, mdocGeneratedNonce]);
+        const clientIdHash = new Uint8Array(await crypto.subtle.digest('SHA-256', clientIdToHash));
+
+        // responseUriHash = SHA-256(CBOR([responseUri, mdocGeneratedNonce]))
+        const responseUriToHash = cbor2.encode([responseUri, mdocGeneratedNonce]);
+        const responseUriHash = new Uint8Array(await crypto.subtle.digest('SHA-256', responseUriToHash));
+
+        // OID4VPHandover = [clientIdHash, responseUriHash, nonce]
+        const handover = [clientIdHash, responseUriHash, nonce];
+
+        return cbor2.encode([null, null, handover]);
+    }
+
+    /**
+     * Creates an OID4VP authorization request URL for redirect-based flows.
+     *
+     * @param {object} options
+     * @param {string} options.clientId - The client identifier value
+     * @param {string} options.requestUri
+     * @param {string} [options.walletScheme] - defaults to 'openid4vp://'
+     * @param {string} [options.requestUriMethod] - e.g. 'post'
+     * @param {string} [options.clientIdScheme] - If set, added as separate param (pre-1.0 / ISO 18013-7 format).
+     *   When provided, clientId should be the plain value (e.g. DNS name), not prefixed.
+     * @returns {string}
+     */
+    createAuthorizationRequestUrl({ clientId, requestUri, walletScheme = WalletScheme.OPENID4VP, requestUriMethod, clientIdScheme } = {}) {
+        const params = new URLSearchParams();
+        params.set('client_id', clientId);
+        if (clientIdScheme) {
+            params.set('client_id_scheme', clientIdScheme);
+        }
+        params.set('request_uri', requestUri);
+        if (requestUriMethod !== undefined && requestUriMethod !== null) {
+            params.set('request_uri_method', requestUriMethod);
+        }
+        return `${walletScheme}?${params.toString()}`;
+    }
+
+    /**
+     * Computes the JWK Thumbprint per RFC 7638.
+     * Supported key types: EC ({crv, kty, x, y}), RSA ({e, kty, n}), OKP ({crv, kty, x})
+     *
+     * @param {object} jwk - JWK object
+     * @returns {Promise<Uint8Array>} 32-byte SHA-256 thumbprint
+     */
+    async computeJwkThumbprint(jwk) {
+        let canonicalMembers;
+
+        if (jwk.kty === 'EC') {
+            canonicalMembers = { crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y };
+        } else if (jwk.kty === 'RSA') {
+            canonicalMembers = { e: jwk.e, kty: jwk.kty, n: jwk.n };
+        } else if (jwk.kty === 'OKP') {
+            canonicalMembers = { crv: jwk.crv, kty: jwk.kty, x: jwk.x };
+        } else {
+            throw new Error(`Unsupported key type: ${jwk.kty}`);
+        }
+
+        const json = JSON.stringify(canonicalMembers);
+        const encoded = new TextEncoder().encode(json);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', encoded);
+        return new Uint8Array(hashBuffer);
+    }
+
+    /**
+     * Creates a signed OID4VP request object JWT.
+     *
+     * @param {object} options
+     * @param {string} options.clientId
+     * @param {string} options.nonce
+     * @param {string} options.state
+     * @param {string} options.responseUri
+     * @param {string[]} options.documentTypes
+     * @param {string[]} options.claims
+     * @param {import('jose').KeyLike} options.privateKey
+     * @param {string[]} options.x5cChain
+     * @param {object} [options.encryptionJwk]
+     * @param {string} [options.walletNonce]
+     * @param {string} [options.responseMode]
+     * @returns {Promise<string>} Signed JWT string
+     */
+    async createRequestObject({
+        clientId, nonce, state, responseUri, documentTypes, claims,
+        privateKey, x5cChain, encryptionJwk, walletNonce,
+        responseMode = ResponseMode.DIRECT_POST_JWT,
+        usePresentationExchange = false,
+        clientIdScheme,
+        typ = 'oauth-authz-req+jwt',
+        kid,
+    }) {
+        const payload = {
+            aud: 'https://self-issued.me/v2',
+            client_id: clientId,
+            nonce,
+            state,
+            response_uri: responseUri,
+            response_type: 'vp_token',
+            response_mode: responseMode,
+        };
+
+        if (clientIdScheme) {
+            payload.client_id_scheme = clientIdScheme;
+        }
+
+        if (usePresentationExchange) {
+            // ISO 18013-7 / OID4VP draft 18 format — Presentation Exchange
+            payload.presentation_definition = this._createPresentationDefinition(documentTypes, claims);
+        } else {
+            // OID4VP 1.0 format — DCQL
+            const credentials = documentTypes.map(docType => ({
+                id: createCredentialId(CredentialFormat.MSO_MDOC, docType),
+                format: CredentialFormat.MSO_MDOC,
+                meta: { doctype_value: docType },
+                claims: claims.map(c => ({ path: c })),
+            }));
+            payload.dcql_query = { credentials };
+        }
+
+        if (walletNonce !== undefined && walletNonce !== null) {
+            payload.wallet_nonce = walletNonce;
+        }
+
+        if (encryptionJwk) {
+            // Strip private key material — only embed public key in the JWT payload
+            const { d, dp, dq, qi, ...publicJwk } = encryptionJwk;
+            payload.client_metadata = {
+                authorization_encrypted_response_alg: 'ECDH-ES',
+                authorization_encrypted_response_enc: 'A256GCM',
+                vp_formats: {
+                    mso_mdoc: {
+                        alg: ['ES256', 'ES384', 'ES512'],
+                    },
+                },
+                require_signed_request_object: true,
+                jwks: {
+                    keys: [{ ...publicJwk, use: 'enc', kid: 'ephemeral-enc-key', alg: 'ECDH-ES' }],
+                },
+            };
+        }
+
+        return signRequestObject(payload, privateKey, x5cChain, 'ES256', { typ, kid, includeIat: !usePresentationExchange });
+    }
+
+    /**
+     * Full verification pipeline for redirect flow mdoc responses.
+     *
+     * @param {object} options
+     * @param {object} options.vpToken - Map of credentialId to array of base64url-encoded tokens
+     * @param {string} options.clientId
+     * @param {string} options.nonce
+     * @param {string} options.responseUri
+     * @param {object} [options.encryptionJwk] - Public JWK used for encryption (to compute thumbprint for OID4VP 1.0)
+     * @param {string} [options.mdocGeneratedNonce] - Wallet-generated nonce from JWE apu header (for ISO 18013-7)
+     * @param {string[]} [options.trustLists] - Trust list identifiers; defaults to ALL_TRUST_LISTS
+     * @returns {Promise<{ claims, valid, trusted, processedDocuments, sessionTranscript }>}
+     */
+    async verify({ vpToken, clientId, nonce, responseUri, encryptionJwk, mdocGeneratedNonce,
+                   trustLists = ALL_TRUST_LISTS, trustedCertificates,
+                   enableCrl = false, crlCacheTtlMs, enableStatusList = false, statusListCacheTtlMs }) {
+        // Build candidate SessionTranscripts — try OID4VP 1.0 first, then ISO 18013-7 fallback
+        const jwkThumbprint = encryptionJwk
+            ? await this.computeJwkThumbprint(encryptionJwk)
+            : null;
+
+        const sessionTranscripts = [];
+        if (mdocGeneratedNonce) {
+            // Try first: ISO 18013-7 Annex B / OID4VP 1.0 Appendix B.3.4.1
+            sessionTranscripts.push(await this._generateISO18013SessionTranscript(clientId, responseUri, nonce, mdocGeneratedNonce));
+        }
+        // Then try: OID4VP 1.0 Appendix B.2.6.1
+        sessionTranscripts.push(await this._generateSessionTranscript(clientId, nonce, jwkThumbprint, responseUri));
+
+        const allClaims = {};
+        let valid = true;
+        let credentialVerified = true;
+        let issuerTrusted = true;
+        let issuerRevoked = false;
+        let credentialRevoked = false;
+        let matchedSessionTranscript = sessionTranscripts[0]; // default to first
+        const processedDocuments = [];
+
+        for (const credentialKey of Object.keys(vpToken)) {
+            const credInfo = CredentialId[credentialKey];
+            if (!credInfo || credInfo.format !== CredentialFormat.MSO_MDOC) {
+                throw new Error(`Unsupported credential format for key: ${credentialKey}`);
+            }
+
+            const tokens = vpToken[credentialKey];
+            for (const token of tokens) {
+                const decoded = await decodeVpToken(token);
+                for (const doc of decoded.documents) {
+                    // Try each SessionTranscript candidate — use the first one where credentialVerified passes
+                    let docResult;
+                    for (const st of sessionTranscripts) {
+                        docResult = await verifyDocument(
+                            doc, st, { trustedCertificates, enableCrl, crlCacheTtlMs, enableStatusList, statusListCacheTtlMs }
+                        );
+                        if (docResult.credentialVerified) {
+                            matchedSessionTranscript = st;
+                            break;
+                        }
+                    }
+
+                    Object.assign(allClaims, docResult.claims);
+
+                    if (!docResult.credentialVerified) credentialVerified = false;
+                    if (!docResult.issuerTrusted) issuerTrusted = false;
+                    if (docResult.issuerRevoked) issuerRevoked = true;
+                    if (docResult.credentialRevoked) credentialRevoked = true;
+                    if (!docResult.valid) valid = false;
+
+                    processedDocuments.push({
+                        claims: docResult.claims,
+                        issuer: docResult.issuer,
+                        valid: docResult.valid,
+                        credentialVerified: docResult.credentialVerified,
+                        issuerTrusted: docResult.issuerTrusted,
+                        issuerRevoked: docResult.issuerRevoked,
+                        credentialRevoked: docResult.credentialRevoked,
+                        invalidReasons: docResult.invalidReasons,
+                        statusListRef: docResult.statusListRef,
+                    });
+                }
+            }
+        }
+
+        return {
+            claims: allClaims,
+            valid,
+            credentialVerified,
+            issuerTrusted,
+            issuerRevoked,
+            credentialRevoked,
+            processedDocuments,
+            sessionTranscript: matchedSessionTranscript,
+        };
+    }
+
+    /**
+     * Parses the wallet's POST body from request_uri_method=post negotiation.
+     *
+     * @param {string} body - URL-encoded form string (application/x-www-form-urlencoded)
+     * @returns {{ walletMetadata: Object, walletNonce: string|undefined }}
+     */
+    parseWalletPost(body) {
+        const params = new URLSearchParams(body);
+        const walletMetadataRaw = params.get('wallet_metadata');
+        const walletNonce = params.get('wallet_nonce') ?? undefined;
+        const walletMetadata = walletMetadataRaw ? JSON.parse(walletMetadataRaw) : undefined;
+        return { walletMetadata, walletNonce };
+    }
+
+    /**
+     * Builds the HTTP 200 response for the wallet after receiving direct_post.
+     *
+     * @param {object} options
+     * @param {string} [options.redirectUri] - Present for same-device flow; absent for cross-device
+     * @returns {{ redirect_uri?: string }}
+     */
+    createDirectPostSuccessResponse({ redirectUri } = {}) {
+        if (redirectUri) {
+            const responseCodeBytes = new Uint8Array(24);
+            crypto.getRandomValues(responseCodeBytes);
+            const responseCode = Array.from(responseCodeBytes)
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join('');
+            const url = new URL(redirectUri);
+            url.searchParams.set('response_code', responseCode);
+            return { redirect_uri: url.toString(), response_code: responseCode };
+        }
+        return {};
+    }
+
+    /**
+     * Processes a direct_post or direct_post.jwt response from a wallet.
+     *
+     * @param {object} options
+     * @param {object} options.responseBody
+     * @param {object} [options.encryptionJwk]
+     * @returns {Promise<{ vpToken: any, state: string }>}
+     */
+    async processDirectPostResponse({ responseBody, encryptionJwk }) {
+        let vpToken;
+        let state;
+
+        if (responseBody.response) {
+            if (!encryptionJwk) {
+                throw new Error('encryptionJwk is required to decrypt a direct_post.jwt response');
+            }
+            // direct_post.jwt — decrypt the JWE
+            const decrypted = await decryptJweResponse(responseBody.response, encryptionJwk);
+            vpToken = typeof decrypted.vp_token === 'string'
+                ? JSON.parse(decrypted.vp_token)
+                : decrypted.vp_token;
+            state = decrypted.state;
+        } else {
+            // plain direct_post
+            vpToken = typeof responseBody.vp_token === 'string'
+                ? JSON.parse(responseBody.vp_token)
+                : responseBody.vp_token;
+            state = responseBody.state;
+        }
+
+        return { vpToken, state };
+    }
+
+    /**
+     * Build a Presentation Exchange presentation_definition for ISO 18013-7 / OID4VP draft 18.
+     * This is the legacy format that older wallets (MATTR, etc.) expect.
+     *
+     * @param {string[]} documentTypes
+     * @param {Array<[string, string]>} claims - [namespace, element] pairs
+     * @returns {Object} presentation_definition
+     */
+    _createPresentationDefinition(documentTypes, claims) {
+        const inputDescriptors = documentTypes.map((docType, idx) => {
+            const fields = claims.map(([namespace, element]) => ({
+                path: [`$['${namespace}']['${element}']`],
+                intent_to_retain: false,
+            }));
+
+            return {
+                id: `${docType}`,
+                format: {
+                    mso_mdoc: {
+                        alg: ['ES256'],
+                    },
+                },
+                constraints: {
+                    limit_disclosure: 'required',
+                    fields,
+                },
+            };
+        });
+
+        return {
+            id: crypto.randomUUID(),
+            input_descriptors: inputDescriptors,
+        };
+    }
+}
+
+const oid4vpRedirectHelper = new OID4VPRedirectHelper();
+
+/**
+ * Generate a base64url-encoded SHA-256 hash of a DER-encoded X.509 certificate.
+ * Used for the `x509_hash` client ID prefix in OID4VP 1.0 / HAIP.
+ * @param {Uint8Array} derCertBytes - DER-encoded X.509 certificate bytes
+ * @returns {Promise<string>} - base64url-encoded SHA-256 hash
+ */
+const generateX509Hash = async (derCertBytes) => {
+    const hashBuffer = await crypto.subtle.digest('SHA-256', derCertBytes);
+    return bufferToBase64Url(hashBuffer);
+};
+
+/**
+ * Convert an array of DER-encoded certificates to the x5c format (RFC 7515 Section 4.1.6).
+ * Returns an array of base64-encoded strings (NOT PEM armored, NOT base64url).
+ * @param {Uint8Array[]} derCerts - Array of DER-encoded certificate bytes
+ * @returns {string[]} - Array of base64-encoded certificate strings
+ */
+const certToX5cChain = (derCerts) => {
+    return derCerts.map(derBytes => bufferToBase64(derBytes));
+};
+
+/**
  * Digital Credentials API Wrapper
  * A library to simplify digital ID verification using the W3C Digital Credentials API
  */
@@ -1273,4 +2357,72 @@ const generateJWK = async () => {
     return jwk;
 };
 
-export { Claim, CredentialFormat, DocumentType, Protocol, ProtocolFormats, createCredentialsRequest, generateJWK, generateNonce, processCredentials, requestCredentials, setTestDataUsage };
+/**
+ * Create an OID4VP authorization request URL for wallet redirect.
+ * @param {Object} options - { clientId, requestUri, walletScheme?, requestUriMethod? }
+ * @returns {string} Authorization request URL
+ */
+const createAuthorizationRequestUrl = (options) => {
+    return oid4vpRedirectHelper.createAuthorizationRequestUrl(options);
+};
+
+/**
+ * Create a signed JWT Request Object for the request_uri endpoint.
+ * @param {Object} options - See OID4VPRedirectHelper.createRequestObject
+ * @returns {Promise<string>} Signed JWT request object
+ */
+const createRequestObject = async (options) => {
+    return oid4vpRedirectHelper.createRequestObject(options);
+};
+
+/**
+ * Process a wallet's direct_post or direct_post.jwt response.
+ * @param {Object} options - { responseBody, encryptionJwk? }
+ * @returns {Promise<Object>} { vpToken, state }
+ */
+const processDirectPostResponse = async (options) => {
+    return oid4vpRedirectHelper.processDirectPostResponse(options);
+};
+
+/**
+ * Verify mdoc credentials from an OID4VP redirect flow response.
+ * @param {Object} options
+ * @param {string[]} [options.trustedCertificates] - PEM-encoded trusted root/IACA certificates
+ * @param {boolean} [options.enableCrl=false] - Check CRL distribution points
+ * @param {number} [options.crlCacheTtlMs=3600000] - CRL cache TTL
+ * @param {boolean} [options.enableStatusList=false] - Check IETF Token Status List
+ * @param {number} [options.statusListCacheTtlMs=300000] - Status list cache TTL
+ * @returns {Promise<Object>} { claims, valid, trusted, processedDocuments, sessionTranscript }
+ */
+const verifyRedirectResponse = async (options) => {
+    return oid4vpRedirectHelper.verify(options);
+};
+
+/**
+ * Compute the JWK SHA-256 Thumbprint per RFC 7638.
+ * @param {Object} jwk - Public JWK
+ * @returns {Promise<Uint8Array>} 32-byte SHA-256 thumbprint
+ */
+const computeJwkThumbprint = async (jwk) => {
+    return oid4vpRedirectHelper.computeJwkThumbprint(jwk);
+};
+
+/**
+ * Parse the wallet's POST body from request_uri_method=post negotiation.
+ * @param {string} body - URL-encoded form body
+ * @returns {Object} { walletMetadata, walletNonce }
+ */
+const parseWalletPost = (body) => {
+    return oid4vpRedirectHelper.parseWalletPost(body);
+};
+
+/**
+ * Create the verifier's response to a wallet direct_post.
+ * @param {Object} options - { redirectUri? }
+ * @returns {Object} HTTP 200 response body
+ */
+const createDirectPostSuccessResponse = (options) => {
+    return oid4vpRedirectHelper.createDirectPostSuccessResponse(options);
+};
+
+export { Claim, ClientIdPrefix, CredentialFormat, DocumentType, Protocol, ProtocolFormats, ResponseMode, WalletScheme, certToX5cChain, computeJwkThumbprint, createAuthorizationRequestUrl, createCredentialsRequest, createDirectPostSuccessResponse, createRequestObject, generateJWK, generateNonce, generateX509Hash, parseWalletPost, processCredentials, processDirectPostResponse, recheckCredentialStatus, requestCredentials, setTestDataUsage, verifyRedirectResponse };

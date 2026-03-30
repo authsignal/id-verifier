@@ -1,7 +1,9 @@
 import * as cbor2 from 'cbor2';
 import { getIssuer } from '../trusted-issuer-registry-helper.js';
+import { verifyIssuerTrustAndRevocation } from '../issuer-verifier.js';
+import { checkTokenStatusList } from '../status-list-helper.js';
 import { REVERSE_CLAIM_MAPPINGS, CredentialFormat } from '../constants.js';
-import { parseX5Chain, x509ToWebCryptoKey } from '../certificate-helper.js';
+import { parseX5Chain, x509ToWebCryptoKey, getCertificateInfo } from '../certificate-helper.js';
 import { verifyCoseSign1, coseKeyToWebCryptoKey } from '../cose-helper.js';
 import { base64urlToUint8Array } from '../utils.js';
 
@@ -11,7 +13,7 @@ export const decodeVpToken = async (vp_token) => {
     return decoded;
 };
 
-export const verifyDocument = async (document, sessionTranscript) => {
+export const verifyDocument = async (document, sessionTranscript, verificationOptions = {}) => {
     const claims = {};
     const invalidReasons = [];
     const { docType, issuerSigned, deviceSigned } = document;
@@ -30,12 +32,67 @@ export const verifyDocument = async (document, sessionTranscript) => {
             }
         }
     }
-    const issuer = await getIssuer(certificate);
+    // Determine issuer trust and CRL revocation
+    let issuerTrusted = false;
+    let issuerRevoked = false;
+    let issuer = null;
+    let statusListRef = null;
+    let credentialRevoked = false;
+
+    if (verificationOptions.trustedCertificates) {
+        const trustResult = await verifyIssuerTrustAndRevocation(certificate, {
+            trustedCertificates: verificationOptions.trustedCertificates,
+            enableCrl: verificationOptions.enableCrl,
+            crlCacheTtlMs: verificationOptions.crlCacheTtlMs,
+        });
+        issuerTrusted = trustResult.trusted;
+        issuerRevoked = trustResult.revoked;
+        if (trustResult.trusted) {
+            issuer = {
+                certificateInfo: getCertificateInfo(certificate),
+                certificate: { data: trustResult.matchedCertificate, format: 'pem' },
+            };
+        }
+    } else {
+        // Fall back to trusted-issuer-registry
+        issuer = await getIssuer(certificate);
+        issuerTrusted = !!issuer;
+    }
+
+    // Check Token Status List if present in MSO and enabled
+    // Support both standard 'status' (RFC 9597) and vendor-prefixed '_status'
+    const msoStatusInfo = issuerAuthPayload.status || issuerAuthPayload._status;
+    if (msoStatusInfo && verificationOptions.enableStatusList) {
+        const statusList = msoStatusInfo.statusList || msoStatusInfo.status_list;
+        if (statusList) {
+            statusListRef = {
+                uri: statusList.uri,
+                index: statusList.idx ?? statusList.index,
+            };
+            const statusResult = await checkTokenStatusList(statusListRef, {
+                enabled: true,
+                cacheTtlMs: verificationOptions.statusListCacheTtlMs,
+            });
+            credentialRevoked = statusResult.revoked;
+        }
+    }
+
+    const credentialVerified = valid && deviceValid && claimsValid;
+
     return {
-        claims: claims,
-        issuer: issuer,
-        valid: valid && deviceValid && claimsValid,
-        invalidReasons: invalidReasons,
+        claims,
+        issuer,
+        valid: credentialVerified && issuerTrusted && !issuerRevoked && !credentialRevoked,
+        credentialVerified,
+        issuerTrusted,
+        issuerRevoked,
+        credentialRevoked,
+        statusListRef,
+        invalidReasons: [
+            ...invalidReasons,
+            ...(issuerRevoked ? ['Issuer certificate revoked via CRL'] : []),
+            ...(credentialRevoked ? ['Credential revoked via status list'] : []),
+        ],
     };
 };
 
@@ -51,19 +108,21 @@ async function verifyIssuerAuth(issuerAuth) {
     } else if(new Date(issuerAuthPayload.validityInfo.validUntil) < now) {
         invalidReason = 'MSO is expired';
     }
+    // Always extract the certificate for issuer info, even if MSO validity failed
+    const coseAlg = protectedHeaders.get(1);
+    //https://datatracker.ietf.org/doc/rfc9360/
+    const x5bag = unprotectedHeaders.get(32);
+    const x5chain = unprotectedHeaders.get(33);
+    const x5t = unprotectedHeaders.get(34);
+    const x5u = unprotectedHeaders.get(35);
+    if(x5bag) {
+    } else if(x5chain) {
+        certificate = parseX5Chain(x5chain);
+    } else if(x5t) {
+    } else if(x5u) {
+    }
+
     if(!invalidReason) {
-        const coseAlg = protectedHeaders.get(1);
-        //https://datatracker.ietf.org/doc/rfc9360/
-        const x5bag = unprotectedHeaders.get(32);
-        const x5chain = unprotectedHeaders.get(33);
-        const x5t = unprotectedHeaders.get(34);
-        const x5u = unprotectedHeaders.get(35);
-        if(x5bag) {
-        } else if(x5chain) {
-            certificate = parseX5Chain(x5chain);
-        } else if(x5t) {
-        } else if(x5u) {
-        }
         if(certificate) {
             const publicKey = await x509ToWebCryptoKey(certificate, coseAlg);
             const signatureValid = await verifyCoseSign1(issuerAuth, publicKey);
